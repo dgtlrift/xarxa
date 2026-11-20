@@ -40,6 +40,10 @@ packetmeta-id = []
 ## Transmit timestamps are correlated back to the packet that produced them by
 ## `PacketMeta::id`, so this implies `packetmeta-id`.
 packetmeta-timestamp = ["packetmeta-id"]
+## Enable the `PacketMeta::next_hop` field: the IP address of the neighbor a
+## packet is routed to, for a driver that maps it to a link address itself, as a
+## 6LoWPAN layer under a `Medium::Ip` interface does.
+packetmeta-next-hop = []
 
 [dependencies]
 document-features = "0.2.11"

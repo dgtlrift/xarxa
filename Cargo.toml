@@ -57,6 +57,7 @@ default = [
     "tcp-sack",
     "iface-bind",
     "packetmeta-timestamp",
+    "packetmeta-next-hop",
 ]
 
 ## Use the heap. Used for:
@@ -156,6 +157,9 @@ packetmeta-id = ["xarxa-driver/packetmeta-id"]
 ## Transmit timestamps are correlated back to the packet that produced them by
 ## `PacketMeta::id`, so this implies `packetmeta-id`.
 packetmeta-timestamp = ["packetmeta-id", "xarxa-driver/packetmeta-timestamp"]
+## Put each packet's next hop in its `PacketMeta`, for a driver that resolves link
+## addresses itself.
+packetmeta-next-hop = ["xarxa-driver/packetmeta-next-hop"]
 
 #! ### Logging
 ## Log with the `log` crate.

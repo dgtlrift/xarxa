@@ -2812,9 +2812,18 @@ impl StackInner {
         iface: &mut IfaceState<'_>,
         dst_addr: IpAddr,
         next_hop: IpAddr,
-        buf: PacketBuf,
+        #[cfg_attr(not(feature = "packetmeta-next-hop"), allow(unused_mut))] mut buf: PacketBuf,
         ethertype: EthernetProtocol,
     ) {
+        #[cfg(feature = "packetmeta-next-hop")]
+        {
+            buf.meta_mut().next_hop = Some(match next_hop {
+                #[cfg(feature = "ipv4")]
+                IpAddr::V4(a) => core::net::IpAddr::V4(a),
+                #[cfg(feature = "ipv6")]
+                IpAddr::V6(a) => core::net::IpAddr::V6(a),
+            });
+        }
         #[cfg(not(any(feature = "medium-ethernet", feature = "medium-ieee802154")))]
         let _ = (dst_addr, next_hop, ethertype);
         #[cfg(not(feature = "medium-ethernet"))]
