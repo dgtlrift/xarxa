@@ -40,6 +40,12 @@ packetmeta-id = []
 ## Transmit timestamps are correlated back to the packet that produced them by
 ## `PacketMeta::id`, so this implies `packetmeta-id`.
 packetmeta-timestamp = ["packetmeta-id"]
+## Enable the `PacketMeta::transport` field and `Driver::poll_local_loss`, by which a
+## driver reports packets it lost before they left the link.
+##
+## Losses are reported by the packet's transport and `PacketMeta::id`, so this
+## implies `packetmeta-id`.
+local-loss = ["packetmeta-id"]
 
 [dependencies]
 document-features = "0.2.11"

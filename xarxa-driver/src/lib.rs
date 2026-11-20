@@ -12,6 +12,8 @@ use core::task::Waker;
 
 pub use buf::{PacketBuf, RawPacketBuf};
 pub use meta::PacketMeta;
+#[cfg(feature = "local-loss")]
+pub use meta::{LocalLoss, LossReason};
 #[cfg(feature = "packetmeta-timestamp")]
 pub use meta::{Timestamp, TxTimestamp};
 
@@ -333,6 +335,24 @@ pub trait Driver {
         None
     }
 
+    /// Poll for a packet lost before it left the link.
+    ///
+    /// Returns the next packet the driver lost, out of those whose
+    /// [`PacketMeta::transport`] was set: one its link layer refused, dropped for
+    /// another, or gave up on after its retries, before it reached the medium. The
+    /// stack uses the reports to resend sooner than an end-to-end signal would let it.
+    ///
+    /// Like transmit timestamps, the reports come an arbitrary time after
+    /// [`transmit`](Self::transmit) returned, in any order, and may never come.
+    /// Report each packet at most once, and only losses.
+    ///
+    /// Drivers that cannot tell always return `None`, which is the default
+    /// implementation.
+    #[cfg(feature = "local-loss")]
+    fn poll_local_loss(&mut self) -> Option<LocalLoss> {
+        None
+    }
+
     /// Set the device's multicast hardware address filter.
     ///
     /// `addrs` is the full list of multicast MAC addresses to listen on. It
@@ -388,6 +408,10 @@ impl<T: Driver + ?Sized> Driver for &mut T {
     #[cfg(feature = "packetmeta-timestamp")]
     fn poll_tx_timestamp(&mut self) -> Option<TxTimestamp> {
         T::poll_tx_timestamp(self)
+    }
+    #[cfg(feature = "local-loss")]
+    fn poll_local_loss(&mut self) -> Option<LocalLoss> {
+        T::poll_local_loss(self)
     }
     fn set_multicast_filter(&mut self, addrs: &[[u8; 6]]) {
         T::set_multicast_filter(self, addrs)

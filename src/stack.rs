@@ -89,6 +89,9 @@ pub(crate) struct StackInner {
     buf_capacity: usize,
     #[cfg(feature = "packetmeta-timestamp")]
     pub(crate) tx_timestamps: TxTimestampQueue,
+    /// The tags on the TCP segments sent, for the drivers' local-loss reports.
+    #[cfg(all(feature = "local-loss", feature = "tcp"))]
+    pub(crate) loss_tags: crate::tcp::LossTags,
     #[cfg_attr(not(any(feature = "udp", feature = "tcp")), allow(dead_code))]
     pub(crate) rand: Rand,
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
@@ -637,6 +640,8 @@ impl<'d> Stack<'d> {
                 buf_capacity,
                 #[cfg(feature = "packetmeta-timestamp")]
                 tx_timestamps: TxTimestampQueue::new(),
+                #[cfg(all(feature = "local-loss", feature = "tcp"))]
+                loss_tags: crate::tcp::LossTags::new(),
                 rand,
                 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
                 neighbor_cache: NeighborCache::new(),
@@ -1242,6 +1247,24 @@ impl<'d> Stack<'d> {
             iface.drain_tx_timestamps(&mut self.inner.tx_timestamps);
         }
 
+        // Hand each TCP segment a driver reports lost to its socket, which sends it
+        // again in the egress below.
+        #[cfg(all(feature = "local-loss", feature = "tcp"))]
+        for (_, iface) in self.ifaces.iter_mut() {
+            while let Some(loss) = iface.poll_local_loss() {
+                debug!("local loss: protocol {} id {}", loss.transport, loss.id);
+                if loss.transport != u8::from(IpProtocol::Tcp) {
+                    continue;
+                }
+                let Some((index, seq)) = self.inner.loss_tags.take(loss.id) else {
+                    continue;
+                };
+                if let Some((_, socket)) = self.sockets.tcp.iter_mut().find(|(i, _)| *i == index) {
+                    socket.on_local_loss(now, seq);
+                }
+            }
+        }
+
         let mut next = 0;
         while let Some(index) = self.ifaces.next_occupied(next) {
             next = index + 1;
@@ -1339,12 +1362,21 @@ impl<'d> Stack<'d> {
                 inner: &mut self.inner,
                 ifaces: &mut self.ifaces,
             };
-            for (_, socket) in self.sockets.tcp.iter_mut() {
+            for (index, socket) in self.sockets.tcp.iter_mut() {
                 // A segment the device has no room for goes out when the driver wakes
                 // the poll task. Nothing signals a freed buffer, so a segment held back
                 // for lack of one, its own or the one of the fragments ahead of it, is
                 // retried soon.
-                if let Err(Blocked::NoBuffer) = socket.dispatch(&mut cx, &mut clock, crate::tcp::transmit) {
+                let transmit = |cx: &mut TxContext<'_, '_>,
+                                route: Option<EgressRoute>,
+                                src_addr: IpAddr,
+                                dst_addr: IpAddr,
+                                hop_limit: u8,
+                                traffic_class: u8,
+                                repr: crate::tcp::TcpRepr<'_>| {
+                    crate::tcp::transmit(cx, route, src_addr, dst_addr, hop_limit, traffic_class, repr, index)
+                };
+                if let Err(Blocked::NoBuffer) = socket.dispatch(&mut cx, &mut clock, transmit) {
                     clock.after(POOL_RETRY_DELAY);
                 }
             }

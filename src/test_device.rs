@@ -19,6 +19,8 @@ use std::vec::Vec;
 
 use xarxa::Stack;
 use xarxa::driver::Capabilities;
+#[cfg(feature = "local-loss")]
+use xarxa::driver::LocalLoss;
 use xarxa::driver::PacketBuf;
 #[cfg(feature = "packetmeta-id")]
 use xarxa::driver::PacketMeta;
@@ -38,6 +40,10 @@ pub type Sent = Rc<RefCell<Vec<Vec<u8>>>>;
 /// The metadata of the transmitted frames, oldest first.
 #[cfg(feature = "packetmeta-id")]
 pub type SentMeta = Rc<RefCell<Vec<PacketMeta>>>;
+
+/// Local-loss reports for the stack to poll, oldest first.
+#[cfg(feature = "local-loss")]
+pub type Losses = Rc<RefCell<VecDeque<LocalLoss>>>;
 
 /// How many more frames the device accepts. `None` is unlimited.
 pub type Room = Rc<Cell<Option<usize>>>;
@@ -95,6 +101,9 @@ pub struct TestDevice {
     /// Transmit timestamps not yet polled.
     #[cfg(feature = "packetmeta-timestamp")]
     tx_stamps: VecDeque<TxTimestamp>,
+    /// Local-loss reports for the stack to poll, oldest first.
+    #[cfg(feature = "local-loss")]
+    pub losses: Losses,
 }
 
 impl TestDevice {
@@ -132,6 +141,8 @@ impl TestDevice {
             tx_stamp: None,
             #[cfg(feature = "packetmeta-timestamp")]
             tx_stamps: VecDeque::new(),
+            #[cfg(feature = "local-loss")]
+            losses: Rc::new(RefCell::new(VecDeque::new())),
         }
     }
 
@@ -257,6 +268,11 @@ impl Driver for TestDevice {
     #[cfg(feature = "packetmeta-timestamp")]
     fn poll_tx_timestamp(&mut self) -> Option<TxTimestamp> {
         self.tx_stamps.pop_front()
+    }
+
+    #[cfg(feature = "local-loss")]
+    fn poll_local_loss(&mut self) -> Option<LocalLoss> {
+        self.losses.borrow_mut().pop_front()
     }
 
     fn set_multicast_filter(&mut self, addrs: &[[u8; 6]]) {

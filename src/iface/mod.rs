@@ -826,6 +826,11 @@ impl IfaceState<'_> {
         self.driver.can_transmit()
     }
 
+    #[cfg(all(feature = "local-loss", feature = "tcp"))]
+    pub(crate) fn poll_local_loss(&mut self) -> Option<crate::driver::LocalLoss> {
+        self.driver.poll_local_loss()
+    }
+
     #[cfg(feature = "packetmeta-timestamp")]
     pub(crate) fn drain_tx_timestamps(&mut self, timestamps: &mut TxTimestampQueue) {
         while let Some(timestamp) = self.driver.poll_tx_timestamp() {

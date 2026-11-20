@@ -229,6 +229,13 @@ impl Controller for Cubic {
         self.recompute_k();
     }
 
+    #[cfg(feature = "local-loss")]
+    fn on_local_loss(&mut self, now: Instant) {
+        // The same reduction as for a CE mark: the segment is sent again at
+        // once, without fast recovery.
+        self.on_ecn(now);
+    }
+
     fn on_rto(&mut self, _now: Instant, in_flight: usize) {
         // RFC 5681: when the retransmission timer fires for a segment that has
         // already been retransmitted by the timer (no new data was ACKed since
