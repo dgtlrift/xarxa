@@ -61,7 +61,7 @@ pub mod raw;
 mod reassembly;
 pub mod route;
 #[cfg(feature = "medium-ieee802154")]
-mod sixlowpan;
+pub mod sixlowpan;
 mod stack;
 mod storage;
 #[cfg(feature = "tcp")]
