@@ -252,6 +252,7 @@ impl AcceptToken {
         s.send_window_max = syn.send_window;
         s.send_mss = syn.send_mss;
         s.congestion_controller.set_mss(syn.send_mss);
+        s.cap_send_mss();
         // Answer with timestamps only if the SYN offered them.
         #[cfg(feature = "tcp-timestamps")]
         {
