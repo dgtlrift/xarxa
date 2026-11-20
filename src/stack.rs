@@ -3041,7 +3041,11 @@ impl StackInner {
         iface: &mut IfaceState<'_>,
         dst_addr: IpAddr,
         next_hop: IpAddr,
-        #[cfg_attr(not(any(feature = "traffic-class", feature = "packetmeta-next-hop")), allow(unused_mut))] mut buf: PacketBuf,
+        #[cfg_attr(
+            not(any(feature = "traffic-class", feature = "packetmeta-next-hop")),
+            allow(unused_mut)
+        )]
+        mut buf: PacketBuf,
         ethertype: EthernetProtocol,
     ) {
         #[cfg(feature = "packetmeta-next-hop")]
