@@ -3,7 +3,7 @@ use crate::{
     time::{Duration, Instant},
 };
 
-use super::Controller;
+use super::{Controller, initial_window};
 
 // Constants for the Cubic congestion control algorithm.
 // See RFC 9438.
@@ -38,14 +38,14 @@ pub struct Cubic {
 impl Cubic {
     pub fn new() -> Cubic {
         let mut cubic = Cubic {
-            w_max: DEFAULT_MSS * 2,
-            cwnd: DEFAULT_MSS * 2,
+            w_max: initial_window(DEFAULT_MSS),
+            cwnd: initial_window(DEFAULT_MSS),
             mss: DEFAULT_MSS,
             rwnd: 64 * DEFAULT_MSS,
             ssthresh: usize::MAX,
             k: 0.0,
-            w_est: (DEFAULT_MSS * 2) as f64,
-            cwnd_prior: DEFAULT_MSS * 2,
+            w_est: initial_window(DEFAULT_MSS) as f64,
+            cwnd_prior: initial_window(DEFAULT_MSS),
 
             recovery_start: None,
             in_fast_recovery: false,
@@ -230,6 +230,10 @@ impl Controller for Cubic {
 
     fn set_mss(&mut self, mss: usize) {
         self.mss = mss;
+        self.cwnd = initial_window(mss).min(self.rwnd);
+        self.w_max = self.cwnd;
+        self.w_est = self.cwnd as f64;
+        self.cwnd_prior = self.cwnd;
         self.recompute_k();
     }
 

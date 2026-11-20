@@ -1,6 +1,6 @@
 use crate::{tcp::RttEstimator, time::Instant};
 
-use super::Controller;
+use super::{Controller, initial_window};
 
 const DEFAULT_MSS: usize = 1024;
 
@@ -22,7 +22,7 @@ pub struct Reno {
 impl Reno {
     pub fn new() -> Self {
         Reno {
-            cwnd: DEFAULT_MSS * 2,
+            cwnd: initial_window(DEFAULT_MSS),
             mss: DEFAULT_MSS,
             ssthresh: usize::MAX,
             rwnd: 64 * DEFAULT_MSS,
@@ -101,6 +101,7 @@ impl Controller for Reno {
 
     fn set_mss(&mut self, mss: usize) {
         self.mss = mss;
+        self.cwnd = initial_window(mss).min(self.rwnd);
     }
 
     fn set_remote_window(&mut self, remote_window: usize) {
