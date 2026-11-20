@@ -2135,10 +2135,21 @@ impl<'d> TcpSocketState<'d> {
                     self.pending_fast_retransmit = false;
                 }
 
+                // Limited Transmit (RFC 3042 § 2): each of the first two duplicate
+                // ACKs lets one more segment go beyond the congestion window, so a
+                // small window still gets the three duplicate ACKs fast retransmit
+                // needs. The window itself doesn't change. Without a congestion
+                // controller the window is unbounded, so this saturates.
+                let limited_transmit = match self.dup_acks {
+                    n @ 1..=2 => usize::from(n) * mss,
+                    _ => 0,
+                };
+                let cwnd = self.congestion_controller.window().saturating_add(limited_transmit);
+
                 // New data, in segments of up to one MSS, up to the edge of the remote
                 // window, with no more in flight than the congestion window. Offsets
                 // count from the first unacknowledged octet.
-                let limit = tx_len.min(self.send_window).min(self.congestion_controller.window());
+                let limit = tx_len.min(self.send_window).min(cwnd);
                 loop {
                     let offset = self.flight_size();
                     let len = limit.saturating_sub(offset).min(mss);
@@ -12971,6 +12982,52 @@ mod test {
             }
         );
         assert_eq!(ecn_recv(&mut s, 2100), [(46 << 2, false, false, 0)]);
+    }
+
+    // =========================================================================================//
+    // Tests for Limited Transmit (RFC 3042).
+    // =========================================================================================//
+
+    #[test]
+    #[cfg(any(feature = "tcp-reno", feature = "tcp-cubic"))]
+    fn test_limited_transmit() {
+        let mut s = socket_established_with_buffer_sizes(512, 64);
+        s.nagle = false;
+        s.send_mss = 16;
+        s.congestion_controller.set_mss(16);
+        s.view().send_slice(&[0x55; 256]).unwrap();
+        let flight = |s: &mut TestSocket, time: u32| {
+            let mut sent = 0;
+            let result: Result<(), ()> = s.sockets.get_mut(0).dispatch(
+                &mut s.stack.tx_context(),
+                &mut Clock::new(Instant::from_millis(time)),
+                |_, _route, _src_addr, _dst_addr, _hop_limit, _traffic_class, repr| {
+                    sent += repr.payload_len();
+                    Ok(())
+                },
+            );
+            assert_eq!(result, Ok(()));
+            sent
+        };
+        // The initial window: four 16-octet segments.
+        assert_eq!(flight(&mut s, 0), 64);
+
+        let dup_ack = TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        };
+        // Each of the first two duplicate ACKs sends one new segment beyond the
+        // window.
+        send!(s, time 10, dup_ack);
+        assert_eq!(s.dup_acks, 1);
+        assert_eq!(flight(&mut s, 10), 16);
+        send!(s, time 20, dup_ack);
+        assert_eq!(s.dup_acks, 2);
+        assert_eq!(flight(&mut s, 20), 16);
+        // The window itself hasn't changed: nothing more goes out.
+        assert_eq!(s.congestion_controller.window(), 64);
+        assert_eq!(flight(&mut s, 30), 0);
     }
 }
 
