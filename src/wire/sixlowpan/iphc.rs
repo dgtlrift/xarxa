@@ -366,9 +366,22 @@ impl Repr {
         ))
     }
 
+    /// The TF field this will emit, and the length of what it carries inline
+    /// (RFC 6282 § 3.1.1): a zero ECN, DSCP or flow label is elided as `None`
+    /// is.
+    fn tf(&self) -> (u8, usize) {
+        let tc = self.ecn.unwrap_or(0) != 0 || self.dscp.unwrap_or(0) != 0;
+        match (self.dscp.unwrap_or(0) != 0, tc, self.flow_label.unwrap_or(0) != 0) {
+            (true, _, true) => (0b00, 4),
+            (false, _, true) => (0b01, 3),
+            (_, true, false) => (0b10, 1),
+            (_, false, false) => (0b11, 0),
+        }
+    }
+
     /// Return the length of the header this will emit.
     pub fn buffer_len(&self) -> usize {
-        let mut len = 2;
+        let mut len = 2 + self.tf().1;
         if let NextHeader::Uncompressed(_) = self.next_header {
             len += 1;
         }
@@ -383,7 +396,8 @@ impl Repr {
     /// Write the header into the front of `buf`.
     ///
     /// Writes exactly [`buffer_len`](Self::buffer_len) bytes. The traffic
-    /// class and flow label are always elided.
+    /// class and flow label are carried inline in the shortest TF form that
+    /// holds them, and elided when zero.
     ///
     /// # Panics
     /// Panics if `buf` is shorter than [`buffer_len`](Self::buffer_len).
@@ -391,9 +405,9 @@ impl Repr {
         let (sac, sam, src_inline, src_len) = compress_src(&self.src_addr, self.ll_src_addr);
         let (m, dam, dst_inline, dst_len) = compress_dst(&self.dst_addr, self.ll_dst_addr);
 
+        let (tf, tf_len) = self.tf();
         let mut iphc = (DISPATCH_IPHC_HEADER as u16) << 13;
-        // The traffic class and flow label are never carried.
-        iphc |= 0b11 << 11;
+        iphc |= (tf as u16) << 11;
         if self.next_header == NextHeader::Compressed {
             iphc |= 1 << 10;
         }
@@ -407,6 +421,15 @@ impl Repr {
         buf[0..2].copy_from_slice(&iphc.to_be_bytes());
 
         let mut offset = 2;
+        let ecn_dscp = (self.ecn.unwrap_or(0) & 0b11) << 6 | (self.dscp.unwrap_or(0) & 0b11_1111);
+        let [fl_hi, fl_lo] = self.flow_label.unwrap_or(0).to_be_bytes();
+        let inline: [u8; 4] = match tf {
+            0b00 => [ecn_dscp, 0, fl_hi, fl_lo],
+            0b01 => [ecn_dscp & 0b1100_0000, fl_hi, fl_lo, 0],
+            _ => [ecn_dscp, 0, 0, 0],
+        };
+        buf[offset..offset + tf_len].copy_from_slice(&inline[..tf_len]);
+        offset += tf_len;
         if let NextHeader::Uncompressed(nh) = self.next_header {
             buf[offset] = nh.into();
             offset += 1;
@@ -513,6 +536,51 @@ mod test {
             repr.src_addr,
             ipv6::Address::new(0xfd00, 0, 0, 0, 0, 0xff, 0xfe00, 0x1234)
         );
+    }
+
+    /// The traffic class and flow label go in the shortest TF form that holds
+    /// them (RFC 6282 § 3.1.1), and parse back.
+    #[test]
+    fn emit_parse_traffic_class() {
+        // (ECN, DSCP, flow label, TF, inline length)
+        let cases = [
+            (0, 0, 0, 0b11, 0),
+            (0b10, 0, 0, 0b10, 1),
+            (0, 46, 0, 0b10, 1),
+            (0b11, 10, 0, 0b10, 1),
+            (0b01, 0, 0x1234, 0b01, 3),
+            (0b10, 46, 0x1234, 0b00, 4),
+        ];
+        for (ecn, dscp, flow_label, tf, inline) in cases {
+            let repr = Repr {
+                src_addr: SRC_LL.as_link_local_address().unwrap(),
+                ll_src_addr: Some(SRC_LL),
+                dst_addr: DST_LL.as_link_local_address().unwrap(),
+                ll_dst_addr: Some(DST_LL),
+                next_header: NextHeader::Compressed,
+                hop_limit: 64,
+                ecn: Some(ecn),
+                dscp: Some(dscp),
+                flow_label: Some(flow_label),
+            };
+            let len = repr.buffer_len();
+            assert_eq!(len, 2 + inline, "{ecn} {dscp} {flow_label}");
+            let mut buf = [0xffu8; MAX_HEADER_LEN];
+            repr.emit(&mut buf[..len]);
+            assert_eq!((buf[0] >> 3) & 0b11, tf, "{ecn} {dscp} {flow_label}");
+            let (parsed, parsed_len) = Repr::parse(&buf[..len], Some(SRC_LL), Some(DST_LL), &[]).unwrap();
+            assert_eq!(parsed_len, len);
+            // What TF elides parses as `None`, which means zero.
+            assert_eq!(
+                (
+                    parsed.ecn.unwrap_or(0),
+                    parsed.dscp.unwrap_or(0),
+                    parsed.flow_label.unwrap_or(0)
+                ),
+                (ecn, dscp, flow_label),
+                "{ecn} {dscp} {flow_label}"
+            );
+        }
     }
 
     /// Emitting a header and parsing it back round-trips, even into a buffer
