@@ -85,6 +85,22 @@ impl core::fmt::Display for InvalidHopLimit {
 #[cfg(any(feature = "udp", feature = "tcp"))]
 impl core::error::Error for InvalidHopLimit {}
 
+/// A DSCP outside its six bits (0 to 63, RFC 2474 § 3).
+#[cfg(any(feature = "udp", feature = "tcp"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct InvalidDscp;
+
+#[cfg(any(feature = "udp", feature = "tcp"))]
+impl core::fmt::Display for InvalidDscp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("invalid DSCP")
+    }
+}
+
+#[cfg(any(feature = "udp", feature = "tcp"))]
+impl core::error::Error for InvalidDscp {}
+
 /// An address is not unicast.
 ///
 /// Returned by [`NeighborCache::insert`](crate::NeighborCache::insert).

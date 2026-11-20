@@ -15,7 +15,7 @@ use crate::driver::PacketBuf;
 use crate::driver::PacketMeta;
 #[cfg(feature = "icmp-errors")]
 use crate::error::IcmpError;
-use crate::error::InvalidHopLimit;
+use crate::error::{InvalidDscp, InvalidHopLimit};
 use crate::iface::IfaceHandle;
 use crate::stack::{EgressRoute, IfaceBinding, Stack, TxContext, addr_score, alloc_ephemeral_port};
 use crate::storage::Slab;
@@ -189,6 +189,10 @@ pub(crate) struct UdpSocketState {
     binding: IfaceBinding,
     rx_queue: BoundedDeque<PacketBuf, UDP_RX_QUEUE_COUNT>,
     hop_limit: Option<u8>,
+    /// The DSCP of outgoing packets (RFC 2474).
+    dscp: u8,
+    /// Whether outgoing packets are ECN-capable, marked ECT(0) (RFC 3168 § 5).
+    ecn_capable: bool,
     /// The last ICMP error reported against this socket, with the remote address
     /// it is about. A single slot: a newer error overwrites an unread older one.
     #[cfg(feature = "icmp-errors")]
@@ -212,6 +216,8 @@ impl UdpSocketState {
             binding: IfaceBinding::Any,
             rx_queue: BoundedDeque::new(),
             hop_limit: None,
+            dscp: 0,
+            ecn_capable: false,
             #[cfg(feature = "icmp-errors")]
             pending_error: None,
             #[cfg(feature = "async")]
@@ -425,6 +431,41 @@ impl UdpSocket<'_, '_> {
         }
         self.inner_mut().hop_limit = hop_limit;
         Ok(())
+    }
+
+    /// Return the DSCP of outgoing packets (RFC 2474 § 3).
+    ///
+    /// See also the [set_dscp](#method.set_dscp) method.
+    pub fn dscp(&self) -> u8 {
+        self.inner().dscp
+    }
+
+    /// Set the DSCP of outgoing packets: the six high bits of the IPv6 Traffic
+    /// Class or the IPv4 DS field (RFC 2474 § 3). It is 0, the default class,
+    /// unless set.
+    ///
+    /// # Errors
+    /// - `InvalidDscp`: if `dscp` is above 63. The socket is left unchanged.
+    pub fn set_dscp(&mut self, dscp: u8) -> Result<(), InvalidDscp> {
+        if dscp > 0b11_1111 {
+            return Err(InvalidDscp);
+        }
+        self.inner_mut().dscp = dscp;
+        Ok(())
+    }
+
+    /// Return whether outgoing packets are ECN-capable.
+    ///
+    /// See also the [set_ecn_capable](#method.set_ecn_capable) method.
+    pub fn ecn_capable(&self) -> bool {
+        self.inner().ecn_capable
+    }
+
+    /// Mark outgoing packets as ECN-capable, ECT(0), or not (RFC 3168 § 5).
+    /// Packets are not ECN-capable unless set: the application must react to
+    /// the congestion that marks report.
+    pub fn set_ecn_capable(&mut self, ecn_capable: bool) {
+        self.inner_mut().ecn_capable = ecn_capable;
     }
 
     /// Bind the socket to an interface, or unbind it with `None`.
@@ -860,7 +901,7 @@ impl UdpSocket<'_, '_> {
     /// [`send_packet`](Self::send_packet), with the metadata converted, so that
     /// only the conversion is compiled per metadata type.
     fn send_packet_meta(&mut self, mut buf: PacketBuf, mut meta: UdpMetadata) -> Result<(), (SendError, PacketBuf)> {
-        let (route, src, hop_limit) = match self.route_datagram(&mut meta) {
+        let (route, src, hop_limit, traffic_class) = match self.route_datagram(&mut meta) {
             Ok(routed) => routed,
             Err(err) => return Err((err, buf)),
         };
@@ -873,6 +914,7 @@ impl UdpSocket<'_, '_> {
             src,
             dst: meta.remote_addr,
             hop_limit,
+            traffic_class,
         };
         self.transmit_datagram(egress, buf);
         Ok(())
@@ -885,7 +927,7 @@ impl UdpSocket<'_, '_> {
         max_size: usize,
         mut meta: UdpMetadata,
     ) -> Result<(PacketBuf, DatagramEgress), SendError> {
-        let (route, src, hop_limit) = self.route_datagram(&mut meta)?;
+        let (route, src, hop_limit, traffic_class) = self.route_datagram(&mut meta)?;
         let headroom = send_headroom(route.ip_headroom, meta.remote_addr.addr.version());
         let Some(mut buf) = self.tx.inner.pool.alloc() else {
             return Err(SendError::NoBuffer);
@@ -901,21 +943,25 @@ impl UdpSocket<'_, '_> {
             src,
             dst: meta.remote_addr,
             hop_limit,
+            traffic_class,
         };
         Ok((buf, egress))
     }
 
     /// Check and route a datagram to send, before a packet buffer is allocated or
     /// changed for it. Fills in the destination in `meta`, and returns the route,
-    /// the source and the hop limit.
-    fn route_datagram(&mut self, meta: &mut UdpMetadata) -> Result<(EgressRoute, SocketAddr, u8), SendError> {
-        let (local, remote, binding, hop_limit) = {
+    /// the source, the hop limit and the Traffic Class.
+    fn route_datagram(&mut self, meta: &mut UdpMetadata) -> Result<(EgressRoute, SocketAddr, u8, u8), SendError> {
+        let (local, remote, binding, hop_limit, traffic_class) = {
             let socket = self.inner();
+            // ECT(0) is 0b10 (RFC 3168 § 5).
+            let ecn = if socket.ecn_capable { 0b10 } else { 0 };
             (
                 socket.local,
                 socket.remote,
                 socket.binding,
                 socket.hop_limit.unwrap_or(64),
+                socket.dscp << 2 | ecn,
             )
         };
 
@@ -984,7 +1030,7 @@ impl UdpSocket<'_, '_> {
             return Err(SendError::DeviceBusy);
         }
 
-        Ok((route, SocketAddr::new(src_addr, local.port), hop_limit))
+        Ok((route, SocketAddr::new(src_addr, local.port), hop_limit, traffic_class))
     }
 
     /// Prepend the UDP header to a datagram's payload and send it.
@@ -994,6 +1040,7 @@ impl UdpSocket<'_, '_> {
             src,
             dst,
             hop_limit,
+            traffic_class,
         } = egress;
         let size = buf.len();
         buf.push_front(UDP_HEADER_LEN);
@@ -1013,8 +1060,15 @@ impl UdpSocket<'_, '_> {
 
         trace!("udp:{}:{}: sending {} octets", src, dst, size);
 
-        self.tx
-            .transmit_ip(&route, buf, src.addr, dst.addr, IpProtocol::Udp, hop_limit);
+        self.tx.transmit_ip(
+            &route,
+            buf,
+            src.addr,
+            dst.addr,
+            IpProtocol::Udp,
+            hop_limit,
+            traffic_class,
+        );
     }
 }
 
@@ -1024,6 +1078,7 @@ struct DatagramEgress {
     src: SocketAddr,
     dst: SocketAddr,
     hop_limit: u8,
+    traffic_class: u8,
 }
 
 /// Headroom for the headers below a UDP payload sent over `version`, on an
@@ -2016,6 +2071,54 @@ mod test {
         assert_eq!(returned.headroom(), 0);
         assert_eq!(returned.len(), returned.capacity());
         assert!(returned.iter().all(|b| *b == 0x5a));
+    }
+
+    #[test]
+    fn test_set_dscp_and_ecn() {
+        // The socket's DSCP and ECN end up in the IP header of every datagram it
+        // sends, in both header builders: 0 and not ECN-capable by default.
+        let driver = TestDevice::new(Medium::Ip);
+        let tx = driver.tx.clone();
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let iface = driver.install(&mut stack, HardwareAddress::Ip);
+        stack
+            .iface(iface)
+            .add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24))
+            .unwrap();
+        stack
+            .iface(iface)
+            .add_ip_addr(IpCidr::new(LOCAL_ADDR_V6.into(), 64))
+            .unwrap();
+        // Adding an IPv6 address may make the stack transmit on its own.
+        tx.borrow_mut().clear();
+
+        let handle = stack.add_udp_socket().unwrap();
+        let mut socket = stack.udp_socket(handle);
+        socket.bind(LOCAL_PORT, ANY).unwrap();
+        assert_eq!((socket.dscp(), socket.ecn_capable()), (0, false));
+        socket.send_slice(b"abcdef", (REMOTE_ADDR_V6, REMOTE_PORT)).unwrap();
+
+        // EF (46), ECN-capable: ECT(0), 0b10.
+        socket.set_dscp(46).unwrap();
+        socket.set_ecn_capable(true);
+        assert_eq!((socket.dscp(), socket.ecn_capable()), (46, true));
+        socket.send_slice(b"abcdef", (REMOTE_ADDR_V6, REMOTE_PORT)).unwrap();
+        socket.send_slice(b"abcdef", (REMOTE_ADDR, REMOTE_PORT)).unwrap();
+
+        // Above six bits is refused, and the DSCP stays.
+        assert_eq!(socket.set_dscp(64), Err(InvalidDscp));
+        assert_eq!(socket.dscp(), 46);
+        {
+            let mut frames = tx.borrow_mut();
+            assert_eq!(frames.len(), 3);
+            let ip = Ipv6Packet::new_checked(&mut frames[0][..]).unwrap();
+            assert_eq!(ip.traffic_class(), 0);
+            let ip = Ipv6Packet::new_checked(&mut frames[1][..]).unwrap();
+            assert_eq!(ip.traffic_class(), 46 << 2 | 0b10);
+            let ip = Ipv4Packet::new_checked(&mut frames[2][..]).unwrap();
+            assert_eq!((ip.dscp(), ip.ecn()), (46, 0b10));
+            assert!(ip.verify_checksum());
+        }
     }
 
     #[test]

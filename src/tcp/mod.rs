@@ -14,7 +14,7 @@ use crate::driver::ChecksumCapabilities;
 use crate::driver::PacketBuf;
 #[cfg(feature = "icmp-errors")]
 use crate::error::IcmpError;
-use crate::error::InvalidHopLimit;
+use crate::error::{InvalidDscp, InvalidHopLimit};
 use crate::iface::IfaceHandle;
 use crate::pool::PoolRef;
 use crate::rand::Rand;
@@ -504,6 +504,8 @@ pub(crate) struct TcpSocketState<'d> {
     keep_alive: Option<Duration>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
     hop_limit: Option<u8>,
+    /// The DSCP of outgoing segments (RFC 2474).
+    dscp: u8,
     /// Current 4-tuple (local and remote addresses).
     tuple: Option<Tuple>,
     /// The interface the socket is bound to. Zero-sized without `iface-bind`.
@@ -647,6 +649,7 @@ impl<'d> TcpSocketState<'d> {
             timeout: None,
             keep_alive: None,
             hop_limit: None,
+            dscp: 0,
             tuple: None,
             binding: IfaceBinding::Any,
             #[cfg(feature = "icmp-errors")]
@@ -729,7 +732,7 @@ impl<'d> TcpSocketState<'d> {
 
     /// Return the socket to the closed state, ready to be reused by `connect`
     /// or `TcpSocket::accept`. Everything the user configured
-    /// (hop limit, timeout, keep-alive, Nagle, ACK delay) is kept; everything
+    /// (hop limit, DSCP, timeout, keep-alive, Nagle, ACK delay) is kept; everything
     /// belonging to the connection is cleared.
     fn reset(&mut self) {
         let rx_cap_log2 = mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
@@ -1793,7 +1796,7 @@ impl<'d> TcpSocketState<'d> {
         &mut self,
         cx: &mut TxContext<'_, '_>,
         clock: &mut Clock,
-        mut emit: impl FnMut(&mut TxContext<'_, '_>, Option<EgressRoute>, IpAddr, IpAddr, u8, TcpRepr) -> Result<(), E>,
+        mut emit: impl FnMut(&mut TxContext<'_, '_>, Option<EgressRoute>, IpAddr, IpAddr, u8, u8, TcpRepr) -> Result<(), E>,
     ) -> Result<(), E> {
         let Some(tuple) = self.tuple else {
             return Ok(());
@@ -1914,7 +1917,19 @@ impl<'d> TcpSocketState<'d> {
         }
 
         let hop_limit = self.hop_limit.unwrap_or(64);
-        let mut send = |repr: TcpRepr| emit(cx, route, tuple.local.addr, tuple.remote.addr, hop_limit, repr);
+        // The DSCP only: ECN on TCP needs its negotiation (RFC 3168 § 6.1.1).
+        let traffic_class = self.dscp << 2;
+        let mut send = |repr: TcpRepr| {
+            emit(
+                cx,
+                route,
+                tuple.local.addr,
+                tuple.remote.addr,
+                hop_limit,
+                traffic_class,
+                repr,
+            )
+        };
 
         // The largest segment our MTU allows. See RFC 6691 for an explanation of
         // this calculation.
@@ -2277,6 +2292,7 @@ pub(crate) fn transmit(
     src_addr: IpAddr,
     dst_addr: IpAddr,
     hop_limit: u8,
+    traffic_class: u8,
     repr: TcpRepr,
 ) -> Result<(), Blocked> {
     let Some(route) = route else {
@@ -2298,7 +2314,15 @@ pub(crate) fn transmit(
         trace!("no packet buffer for segment to {}, holding it back", dst_addr);
         return Err(Blocked::NoBuffer);
     };
-    cx.transmit_ip(&route, buf, src_addr, dst_addr, IpProtocol::Tcp, hop_limit);
+    cx.transmit_ip(
+        &route,
+        buf,
+        src_addr,
+        dst_addr,
+        IpProtocol::Tcp,
+        hop_limit,
+        traffic_class,
+    );
     Ok(())
 }
 
@@ -2496,6 +2520,28 @@ impl<'d> TcpSocket<'_, 'd> {
             return Err(InvalidHopLimit);
         }
         self.inner_mut().hop_limit = hop_limit;
+        Ok(())
+    }
+
+    /// Return the DSCP of outgoing segments (RFC 2474 § 3).
+    ///
+    /// See also the [set_dscp](#method.set_dscp) method.
+    pub fn dscp(&self) -> u8 {
+        self.inner().dscp
+    }
+
+    /// Set the DSCP of outgoing segments: the six high bits of the IPv6 Traffic
+    /// Class or the IPv4 DS field (RFC 2474 § 3). It is 0, the default class,
+    /// unless set. Segments are not ECN-capable: that needs ECN's negotiation
+    /// (RFC 3168 § 6.1.1).
+    ///
+    /// # Errors
+    /// - `InvalidDscp`: if `dscp` is above 63. The socket is left unchanged.
+    pub fn set_dscp(&mut self, dscp: u8) -> Result<(), InvalidDscp> {
+        if dscp > 0b11_1111 {
+            return Err(InvalidDscp);
+        }
+        self.inner_mut().dscp = dscp;
         Ok(())
     }
 
@@ -3153,7 +3199,7 @@ mod test {
         let result: Result<(), ()> = socket.sockets.get_mut(0).dispatch(
             &mut socket.stack.tx_context(),
             &mut clock,
-            |_, _route, src_addr, dst_addr, _hop_limit, tcp_repr| {
+            |_, _route, src_addr, dst_addr, _hop_limit, _traffic_class, tcp_repr| {
                 assert_eq!(src_addr, LOCAL_ADDR.into());
                 assert_eq!(dst_addr, REMOTE_ADDR.into());
 
@@ -3181,7 +3227,7 @@ mod test {
         let result: Result<(), ()> = socket.sockets.get_mut(0).dispatch(
             &mut socket.stack.tx_context(),
             &mut Clock::new(timestamp),
-            |_, _route, _src_addr, _dst_addr, _hop_limit, tcp_repr| {
+            |_, _route, _src_addr, _dst_addr, _hop_limit, _traffic_class, tcp_repr| {
                 if sent.len() == room {
                     return Err(());
                 }
@@ -10076,7 +10122,7 @@ mod test {
             s.sockets.get_mut(0).dispatch(
                 &mut s.stack.tx_context(),
                 &mut Clock::new(Instant::ZERO),
-                |_, _, _, _, hop_limit, _| {
+                |_, _, _, _, hop_limit, _, _| {
                     assert_eq!(hop_limit, 0x2a);
                     Ok::<_, ()>(())
                 }
@@ -10088,6 +10134,31 @@ mod test {
         // see https://github.com/xarxa-rs/xarxa/issues/601.
         s.reset();
         assert_eq!(s.view().hop_limit(), Some(0x2a));
+    }
+
+    #[test]
+    fn test_set_dscp() {
+        let mut s = socket_syn_received();
+        assert_eq!(s.view().dscp(), 0);
+
+        // The DSCP goes in the Traffic Class's six high bits, without ECN.
+        s.view().set_dscp(46).unwrap();
+        assert_eq!(
+            s.sockets.get_mut(0).dispatch(
+                &mut s.stack.tx_context(),
+                &mut Clock::new(Instant::ZERO),
+                |_, _, _, _, _, traffic_class, _| {
+                    assert_eq!(traffic_class, 46 << 2);
+                    Ok::<_, ()>(())
+                }
+            ),
+            Ok(())
+        );
+
+        // Above six bits is refused, and the DSCP survives a reset.
+        assert_eq!(s.view().set_dscp(64), Err(InvalidDscp));
+        s.reset();
+        assert_eq!(s.view().dscp(), 46);
     }
 
     #[test]
@@ -12447,7 +12518,7 @@ mod test {
         let result: Result<(), ()> = s.sockets.get_mut(0).dispatch(
             &mut s.stack.tx_context(),
             &mut Clock::new(Instant::ZERO),
-            |_, route, _src_addr, _dst_addr, _hop_limit, _repr| {
+            |_, route, _src_addr, _dst_addr, _hop_limit, _traffic_class, _repr| {
                 routes.push(route.is_some());
                 Ok(())
             },
@@ -12544,6 +12615,7 @@ mod stack_test {
             LOCAL_ADDR,
             IpProtocol::Tcp,
             64,
+            0,
             &ChecksumCapabilities::default(),
         );
         buf.to_vec()

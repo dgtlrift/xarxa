@@ -520,6 +520,7 @@ impl IfaceState<'_> {
             group_addr,
             IpProtocol::Igmp,
             1,
+            0,
             &self.checksum_caps(),
         );
         Some(pkt)
@@ -544,6 +545,7 @@ impl IfaceState<'_> {
             IPV4_MULTICAST_ALL_ROUTERS,
             IpProtocol::Igmp,
             1,
+            0,
             &self.checksum_caps(),
         );
         Some(pkt)
@@ -665,7 +667,7 @@ impl IfaceState<'_> {
         push_mldv2_router_alert(pkt);
 
         // All MLDv2 messages must be sent with an IPv6 Hop limit of 1.
-        crate::stack::push_ipv6_header(pkt, src_addr, dst_addr, IpProtocol::HopByHop, 1);
+        crate::stack::push_ipv6_header(pkt, src_addr, dst_addr, IpProtocol::HopByHop, 1, 0);
     }
 }
 
