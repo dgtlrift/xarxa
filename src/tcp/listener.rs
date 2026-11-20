@@ -41,6 +41,8 @@ struct PendingSyn {
     /// The timestamp option of the SYN, if present.
     #[cfg(feature = "tcp-timestamps")]
     timestamp: Option<TcpTimestampRepr>,
+    /// Whether it was an ECN-setup SYN, with ECE and CWR (RFC 3168 § 6.1.1).
+    ecn_setup: bool,
 }
 
 /// TCP listener state, stored inside the stack.
@@ -114,6 +116,7 @@ impl TcpListenerState {
             },
             #[cfg(feature = "tcp-timestamps")]
             timestamp: repr.timestamp,
+            ecn_setup: repr.ece && repr.cwr,
         };
 
         if let Some(entry) = self.queue.iter_mut().find(|s| s.tuple == tuple) {
@@ -252,6 +255,7 @@ impl AcceptToken {
         s.send_window_max = syn.send_window;
         s.send_mss = syn.send_mss;
         s.congestion_controller.set_mss(syn.send_mss);
+        s.ecn.active = s.ecn_usable() && syn.ecn_setup;
         // Answer with timestamps only if the SYN offered them.
         #[cfg(feature = "tcp-timestamps")]
         {

@@ -31,6 +31,10 @@ pub(crate) struct TcpRepr<'a> {
     pub window_len: u16,
     pub window_scale: Option<u8>,
     pub max_seg_size: Option<u16>,
+    /// The ECN-Echo flag (RFC 3168 § 6.1).
+    pub ece: bool,
+    /// The Congestion Window Reduced flag (RFC 3168 § 6.1).
+    pub cwr: bool,
     #[cfg(feature = "tcp-sack")]
     pub sack_permitted: bool,
     #[cfg(feature = "tcp-sack")]
@@ -147,6 +151,8 @@ impl<'a> TcpRepr<'a> {
             window_len: packet.window_len(),
             window_scale,
             max_seg_size,
+            ece: packet.ece(),
+            cwr: packet.cwr(),
             #[cfg(feature = "tcp-sack")]
             sack_permitted,
             // The socket only sends SACK blocks. It doesn't act on the ones it receives.
@@ -228,6 +234,8 @@ impl<'a> TcpRepr<'a> {
             TcpControl::Rst => packet.set_rst(true),
         }
         packet.set_ack(self.ack_number.is_some());
+        packet.set_ece(self.ece);
+        packet.set_cwr(self.cwr);
         {
             // The options are written straight into the header, padded to its
             // length with end-of-list options.
@@ -329,6 +337,8 @@ mod test {
             window_scale: None,
             control: TcpControl::Syn,
             max_seg_size: None,
+            ece: false,
+            cwr: false,
             #[cfg(feature = "tcp-sack")]
             sack_permitted: false,
             #[cfg(feature = "tcp-sack")]

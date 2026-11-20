@@ -1418,6 +1418,8 @@ impl<'d> Stack<'d> {
         let next_header = ipv4_packet.next_header();
         let header_len = ipv4_packet.header_len() as usize;
         let total_len = ipv4_packet.total_len() as usize;
+        #[cfg(feature = "tcp")]
+        let ecn = ipv4_packet.ecn();
 
         // The DHCP client sees its replies before the destination check: they may
         // be addressed to the address being leased, which isn't ours yet, or to
@@ -1534,7 +1536,7 @@ impl<'d> Stack<'d> {
                 buf,
             ),
             #[cfg(feature = "tcp")]
-            IpProtocol::Tcp => self.process_tcp(iface, IpAddr::V4(src_addr), IpAddr::V4(dst_addr), buf, now),
+            IpProtocol::Tcp => self.process_tcp(iface, IpAddr::V4(src_addr), IpAddr::V4(dst_addr), ecn, buf, now),
             _ => {
                 trace!("ipv4: protocol {} not supported", next_header);
                 // ICMP protocol unreachable (RFC 792): restore the IP header so the
@@ -1565,6 +1567,7 @@ impl<'d> Stack<'d> {
         iface: IfaceHandle,
         src_addr: IpAddr,
         dst_addr: IpAddr,
+        ecn: u8,
         mut buf: PacketBuf,
         now: Instant,
     ) {
@@ -1596,7 +1599,7 @@ impl<'d> Stack<'d> {
         for (_, socket) in self.sockets.tcp.iter_mut() {
             if socket.binding_matches(iface) && socket.accepts(&src_addr, &dst_addr, &tcp_repr) {
                 matched = true;
-                result = socket.process(now, &src_addr, &dst_addr, &tcp_repr);
+                result = socket.process(now, &src_addr, &dst_addr, ecn, &tcp_repr);
                 break;
             }
         }
@@ -1783,6 +1786,8 @@ impl<'d> Stack<'d> {
         let hop_limit = ipv6_packet.hop_limit();
         let next_header = ipv6_packet.next_header();
         let payload_len = ipv6_packet.payload_len() as usize;
+        #[cfg(feature = "tcp")]
+        let ecn = ipv6_packet.traffic_class() & 0b11;
 
         if !src_addr.x_is_unicast() {
             // Discard packets with non-unicast source addresses.
@@ -1872,7 +1877,7 @@ impl<'d> Stack<'d> {
                 buf,
             ),
             #[cfg(feature = "tcp")]
-            IpProtocol::Tcp => self.process_tcp(iface, IpAddr::V6(src_addr), IpAddr::V6(dst_addr), buf, now),
+            IpProtocol::Tcp => self.process_tcp(iface, IpAddr::V6(src_addr), IpAddr::V6(dst_addr), ecn, buf, now),
             _ => {
                 trace!("ipv6: protocol {} not supported", next_header);
                 // ICMPv6 parameter problem, unrecognized next header (RFC 4443
@@ -6750,6 +6755,8 @@ pub(crate) mod test {
                 window_len: 1000,
                 window_scale: None,
                 max_seg_size: None,
+                ece: false,
+                cwr: false,
                 #[cfg(feature = "tcp-sack")]
                 sack_permitted: false,
                 #[cfg(feature = "tcp-sack")]

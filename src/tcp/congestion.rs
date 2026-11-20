@@ -30,6 +30,10 @@ pub(super) trait Controller {
     /// Fired after an inferred loss via three duplicate acks.
     fn on_loss(&mut self, now: Instant, in_flight: usize) {}
 
+    /// Fired when an ACK echoes a CE mark (RFC 3168 § 6.1.2), at most once per
+    /// window of data: reduce the window as for a loss, without retransmitting.
+    fn on_ecn(&mut self, now: Instant) {}
+
     fn pre_transmit(&mut self, now: Instant) {}
 
     fn post_transmit(&mut self, now: Instant, len: usize) {}

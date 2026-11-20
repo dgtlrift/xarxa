@@ -83,6 +83,13 @@ impl Controller for Reno {
         }
     }
 
+    fn on_ecn(&mut self, _now: Instant) {
+        // RFC 3168 § 6.1.2: halve the window and the slow start threshold, so
+        // the window then grows by congestion avoidance.
+        self.ssthresh = (self.cwnd >> 1).max(2 * self.mss);
+        self.cwnd = self.ssthresh.min(self.rwnd);
+    }
+
     fn on_rto(&mut self, _now: Instant, in_flight: usize) {
         // RFC 5681: when the retransmission timer fires for a segment that has
         // already been retransmitted by the timer (no new data was ACKed since
