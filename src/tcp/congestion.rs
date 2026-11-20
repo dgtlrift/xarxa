@@ -42,6 +42,12 @@ pub(super) trait Controller {
     /// Fired after an inferred loss via three duplicate acks.
     fn on_loss(&mut self, now: Instant, in_flight: usize) {}
 
+    /// Fired when the driver reports a segment lost before it left the link, at
+    /// most once per window of data: reduce the window. The segment is sent
+    /// again at once, without fast recovery.
+    #[cfg(feature = "local-loss")]
+    fn on_local_loss(&mut self, now: Instant) {}
+
     fn pre_transmit(&mut self, now: Instant) {}
 
     fn post_transmit(&mut self, now: Instant, len: usize) {}

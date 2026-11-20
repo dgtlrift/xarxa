@@ -34,6 +34,8 @@ use crate::wire::{
 mod congestion;
 #[cfg(feature = "tcp-listener")]
 mod listener;
+#[cfg(feature = "local-loss")]
+mod local_loss;
 mod repr;
 mod ring_buffer;
 
@@ -42,6 +44,8 @@ use self::congestion::Controller as _;
 pub use self::listener::{AcceptToken, TcpListener, TcpListenerHandle, TcpListenerIter};
 #[cfg(feature = "tcp-listener")]
 pub(crate) use self::listener::{TcpListenerState, process_listeners};
+#[cfg(feature = "local-loss")]
+pub(crate) use self::local_loss::LossTags;
 pub(crate) use self::repr::TcpRepr;
 #[cfg(feature = "tcp-timestamps")]
 pub(crate) use self::repr::TcpTimestampRepr;
@@ -589,6 +593,12 @@ pub(crate) struct TcpSocketState<'d> {
     /// The congestion control algorithm.
     congestion_controller: congestion::Congestion,
 
+    /// After a local-loss report reduced the window, the sequence number an ACK
+    /// must pass before another may (RFC 3168 § 6.1.2's rule for CE, applied to
+    /// local losses).
+    #[cfg(feature = "local-loss")]
+    local_loss_recover: Option<TcpSeqNumber>,
+
     /// Snd.TS.OK (RFC 7323): whether the TCP timestamp option is in use on this connection.
     /// We offer it in the SYN of every connection we open, and answer with it if
     /// the peer offered it; it stays on only if both ends did.
@@ -683,6 +693,8 @@ impl<'d> TcpSocketState<'d> {
             #[cfg(feature = "tcp-timestamps")]
             send_ts_offset: 0,
             congestion_controller: congestion::Congestion::new(),
+            #[cfg(feature = "local-loss")]
+            local_loss_recover: None,
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
@@ -776,6 +788,10 @@ impl<'d> TcpSocketState<'d> {
         self.challenge_ack_limit = ChallengeAckLimit::None;
         self.acks_owed = 0;
         self.congestion_controller = congestion::Congestion::new();
+        #[cfg(feature = "local-loss")]
+        {
+            self.local_loss_recover = None;
+        }
         #[cfg(feature = "tcp-sack")]
         {
             self.local_sack_history = [None, None, None];
@@ -809,6 +825,28 @@ impl<'d> TcpSocketState<'d> {
     }
 
     /// Number of octets transmitted but not yet ACKed.
+    /// The driver lost the segment that starts at `seq` before it left the link:
+    /// send again from it at once, instead of waiting for three duplicate ACKs or
+    /// the timer, and reduce the window, at most once per window of data.
+    #[cfg(feature = "local-loss")]
+    pub(crate) fn on_local_loss(&mut self, now: Instant, seq: TcpSeqNumber) {
+        // Only a segment still unacknowledged, and not already being sent again,
+        // matters.
+        if seq < self.send_unack || seq >= self.send_next {
+            return;
+        }
+        debug!("local loss of seq {}: sending again from it", seq);
+        let sent = self.send_next;
+        self.send_next = seq;
+        // Karn's algorithm: no RTT sample from a segment sent again. The timer
+        // doesn't back off: only its expiry does that (RFC 6298 § 5.5).
+        self.rtte.on_retransmit();
+        if self.local_loss_recover.is_none_or(|recover| self.send_unack >= recover) {
+            self.congestion_controller.on_local_loss(now);
+            self.local_loss_recover = Some(sent);
+        }
+    }
+
     fn flight_size(&self) -> usize {
         self.send_next - self.send_unack
     }
@@ -2278,7 +2316,10 @@ pub(crate) fn transmit(
     dst_addr: IpAddr,
     hop_limit: u8,
     repr: TcpRepr,
+    socket: usize,
 ) -> Result<(), Blocked> {
+    #[cfg(not(feature = "local-loss"))]
+    let _ = socket;
     let Some(route) = route else {
         debug!("no route to {}, dropping packet", dst_addr);
         return Ok(());
@@ -2287,7 +2328,8 @@ pub(crate) fn transmit(
         trace!("interface has no room for segment to {}, holding it back", dst_addr);
         return Err(blocked);
     }
-    let Some(buf) = build_tcp_packet(
+    #[cfg_attr(not(feature = "local-loss"), allow(unused_mut))]
+    let Some(mut buf) = build_tcp_packet(
         cx.inner.pool,
         route.ip_headroom,
         &repr,
@@ -2298,6 +2340,14 @@ pub(crate) fn transmit(
         trace!("no packet buffer for segment to {}, holding it back", dst_addr);
         return Err(Blocked::NoBuffer);
     };
+    // A segment that carries data is tagged, so that the driver can report it
+    // lost, by `socket`, its index in the socket slab.
+    #[cfg(feature = "local-loss")]
+    if repr.payload_len() != 0 {
+        let meta = buf.meta_mut();
+        meta.id = cx.inner.loss_tags.tag(socket, repr.seq_number);
+        meta.transport = Some(u8::from(IpProtocol::Tcp));
+    }
     cx.transmit_ip(&route, buf, src_addr, dst_addr, IpProtocol::Tcp, hop_limit);
     Ok(())
 }
@@ -12529,6 +12579,49 @@ mod test {
             ..RECV_TEMPL
         }));
     }
+
+    // =========================================================================================//
+    // Tests for local-loss reports.
+    // =========================================================================================//
+
+    #[test]
+    #[cfg(all(feature = "local-loss", any(feature = "tcp-reno", feature = "tcp-cubic")))]
+    fn test_local_loss() {
+        let mut s = socket_established_with_buffer_sizes(512, 64);
+        s.nagle = false;
+        s.send_mss = 16;
+        s.congestion_controller.set_mss(16);
+        s.view().send_slice(&[0x55; 256]).unwrap();
+        let mut sent = Vec::new();
+        let result: Result<(), ()> = s.sockets.get_mut(0).dispatch(
+            &mut s.stack.tx_context(),
+            &mut Clock::new(Instant::ZERO),
+            |_, _route, _src_addr, _dst_addr, _hop_limit, repr| {
+                sent.push(repr.seq_number);
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(sent.len(), 4);
+        let rto = s.rtte.retransmission_timeout();
+        let now = Instant::from_millis(20);
+
+        // The second segment is lost: sending starts again from it, and the
+        // window is reduced, but the retransmission timer doesn't back off.
+        s.on_local_loss(now, sent[1]);
+        assert_eq!(s.send_next, sent[1]);
+        let reduced = s.congestion_controller.window();
+        assert!(reduced < 64);
+        assert_eq!(s.rtte.retransmission_timeout(), rto);
+        // A report from the same window resends, but doesn't reduce it again.
+        s.send_next = sent[3] + 16;
+        s.on_local_loss(now, sent[2]);
+        assert_eq!(s.send_next, sent[2]);
+        assert_eq!(s.congestion_controller.window(), reduced);
+        // A report of a segment not in flight is ignored.
+        s.on_local_loss(now, sent[3] + 16);
+        assert_eq!(s.send_next, sent[2]);
+    }
 }
 
 #[cfg(all(test, feature = "medium-ip", feature = "ipv4"))]
@@ -12928,5 +13021,67 @@ mod stack_test {
         let mut data = [0; 9];
         assert_eq!(stack.tcp_socket(h).recv_slice(&mut data), Ok(9));
         assert_eq!(&data, b"abcxyzxyz");
+    }
+
+    /// A data segment carries a tag, and the driver's report of its loss makes
+    /// the next poll send it again.
+    #[test]
+    #[cfg(all(feature = "local-loss", feature = "tcp-listener"))]
+    fn test_stack_local_loss() {
+        let (mut stack, driver) = stack();
+        let lh = stack.add_tcp_listener().unwrap();
+        stack.tcp_listener(lh).listen(LOCAL_PORT).unwrap();
+        driver.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ,
+            ..SEND_TEMPL
+        }));
+        stack.poll(Instant::from_millis(0));
+        let token = stack.tcp_listener(lh).accept().unwrap();
+        let h = stack
+            .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
+        stack.tcp_socket(h).accept(token).unwrap();
+        stack.poll(Instant::from_millis(0));
+        driver.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        }));
+        stack.poll(Instant::from_millis(1));
+        assert_eq!(stack.tcp_socket(h).state(), State::Established);
+        driver.tx.borrow_mut().clear();
+        driver.tx_meta.borrow_mut().clear();
+
+        // Only the data segment is tagged.
+        stack.tcp_socket(h).send_slice(b"abcd").unwrap();
+        stack.poll(Instant::from_millis(2));
+        let meta = *driver.tx_meta.borrow().last().unwrap();
+        assert_eq!(meta.transport, Some(6));
+        driver.tx.borrow_mut().clear();
+
+        // An unknown ID, or another transport, is ignored.
+        for (transport, id) in [(6, meta.id.wrapping_add(1)), (17, meta.id)] {
+            driver.losses.borrow_mut().push_back(crate::driver::LocalLoss {
+                transport,
+                id,
+                reason: crate::driver::LossReason::NoAck,
+            });
+        }
+        stack.poll(Instant::from_millis(3));
+        assert!(driver.tx.borrow().is_empty());
+
+        // The report of its loss sends it again at once.
+        driver.losses.borrow_mut().push_back(crate::driver::LocalLoss {
+            transport: 6,
+            id: meta.id,
+            reason: crate::driver::LossReason::NoAck,
+        });
+        stack.poll(Instant::from_millis(4));
+        let mut frame = driver.tx.borrow_mut().remove(0);
+        parse_tx(&mut frame, |tcp| {
+            assert_eq!(tcp.seq_number(), LOCAL_SEQ + 1);
+            assert_eq!(tcp.payload(), b"abcd");
+        });
     }
 }

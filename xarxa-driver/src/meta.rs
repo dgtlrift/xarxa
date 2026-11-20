@@ -99,6 +99,52 @@ pub struct PacketMeta {
     /// them to be dropped.
     #[cfg(feature = "packetmeta-timestamp")]
     pub request_timestamp: bool,
+
+    /// The transport protocol whose packet [`id`](Self::id) names, as an IP protocol
+    /// number (6 for TCP), if the stack wants to hear of the packet's loss.
+    ///
+    /// A driver that can tell reports such a packet lost before it left the link,
+    /// such as one its link layer refused or gave up on, through
+    /// [`Driver::poll_local_loss`](crate::Driver::poll_local_loss), by this and the
+    /// packet's `id`. The stack sets it on TCP segments that carry data.
+    ///
+    /// Meaningful on packets to transmit only. Defaults to `None`.
+    #[cfg(feature = "local-loss")]
+    pub transport: Option<u8>,
+}
+
+/// Why a driver lost a packet before it left the link.
+///
+/// The reasons follow the link layer's own reports, such as IEEE 802.15.4's
+/// MCPS-DATA.confirm statuses.
+#[cfg(feature = "local-loss")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+#[non_exhaustive]
+pub enum LossReason {
+    /// The link layer had no room for the packet.
+    Refused,
+    /// The link layer queued the packet, then dropped it for one of a higher class.
+    Dropped,
+    /// No acknowledgment came after every retry.
+    NoAck,
+    /// The channel was busy at every attempt.
+    ChannelBusy,
+}
+
+/// A packet lost before it left the link, reported by
+/// [`Driver::poll_local_loss`](crate::Driver::poll_local_loss) by its
+/// [`PacketMeta::transport`] and [`PacketMeta::id`].
+#[cfg(feature = "local-loss")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+pub struct LocalLoss {
+    /// The packet's [`PacketMeta::transport`].
+    pub transport: u8,
+    /// The packet's [`PacketMeta::id`].
+    pub id: u32,
+    /// Why it was lost.
+    pub reason: LossReason,
 }
 
 /// The timestamp of a transmitted packet, reported by

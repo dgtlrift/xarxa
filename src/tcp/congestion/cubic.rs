@@ -210,6 +210,26 @@ impl Controller for Cubic {
         }
     }
 
+    #[cfg(feature = "local-loss")]
+    fn on_local_loss(&mut self, now: Instant) {
+        // A congestion event like a loss (RFC 9438 § 4.6), but the segment is
+        // sent again at once, so there is no fast recovery: the window drops to
+        // the new threshold.
+        self.idle_start = None;
+        self.cwnd_prior = self.cwnd;
+        // RFC 9438 § 4.7: fast convergence, as on a loss.
+        self.w_max = if self.cwnd < self.w_max {
+            ((self.cwnd as f64) * (1.0 + BETA_CUBIC) / 2.0) as usize
+        } else {
+            self.cwnd
+        };
+        self.ssthresh = ((self.cwnd as f64 * BETA_CUBIC) as usize).max(2 * self.mss);
+        self.cwnd = self.ssthresh.min(self.rwnd);
+        self.w_est = self.cwnd as f64;
+        self.recovery_start = Some(now);
+        self.recompute_k();
+    }
+
     fn on_rto(&mut self, _now: Instant, in_flight: usize) {
         // RFC 5681: when the retransmission timer fires for a segment that has
         // already been retransmitted by the timer (no new data was ACKed since
