@@ -58,6 +58,7 @@ default = [
     "iface-bind",
     "packetmeta-timestamp",
     "local-loss",
+    "traffic-class",
 ]
 
 ## Use the heap. Used for:
@@ -164,6 +165,11 @@ packetmeta-timestamp = ["packetmeta-id", "xarxa-driver/packetmeta-timestamp"]
 ## Reports are correlated back to the segment by `PacketMeta::id`, so this implies
 ## `packetmeta-id`.
 local-loss = ["packetmeta-id", "xarxa-driver/local-loss"]
+## Pass each packet's Traffic Class down to the driver in its `PacketMeta`, mark
+## ECN-capable packets CE while the driver says the link is congested (RFC 3168 § 5),
+## and tell the driver of received CE marks (`Driver::congested`,
+## `Driver::congestion_seen`).
+traffic-class = ["xarxa-driver/traffic-class"]
 
 #! ### Logging
 ## Log with the `log` crate.

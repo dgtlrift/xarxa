@@ -1519,6 +1519,11 @@ impl<'d> Stack<'d> {
         if ipv4_packet.version() != 4 {
             return;
         }
+        // A CE mark is a hint for the link layer, whoever the packet is for.
+        #[cfg(feature = "traffic-class")]
+        if ipv4_packet.ecn() == 0b11 {
+            self.ifaces.get_mut(iface.index()).driver.congestion_seen();
+        }
         let checksum_caps = self.ifaces.get(iface.index()).checksum_caps();
         if !checksum_caps.ipv4.rx && !ipv4_packet.verify_checksum() {
             trace!("ipv4: header checksum incorrect");
@@ -1906,6 +1911,11 @@ impl<'d> Stack<'d> {
 
         if ipv6_packet.version() != 6 {
             return;
+        }
+        // A CE mark is a hint for the link layer, whoever the packet is for.
+        #[cfg(feature = "traffic-class")]
+        if ipv6_packet.traffic_class() & 0b11 == 0b11 {
+            self.ifaces.get_mut(iface.index()).driver.congestion_seen();
         }
 
         let src_addr = ipv6_packet.src_addr();
@@ -3031,9 +3041,12 @@ impl StackInner {
         iface: &mut IfaceState<'_>,
         dst_addr: IpAddr,
         next_hop: IpAddr,
-        buf: PacketBuf,
+        #[cfg_attr(not(feature = "traffic-class"), allow(unused_mut))] mut buf: PacketBuf,
         ethertype: EthernetProtocol,
     ) {
+        #[cfg(feature = "traffic-class")]
+        mark_and_tag(iface, &mut buf);
+
         #[cfg(not(any(feature = "medium-ethernet", feature = "medium-ieee802154")))]
         let _ = (dst_addr, next_hop, ethertype);
         #[cfg(not(feature = "medium-ethernet"))]
@@ -3102,6 +3115,40 @@ impl StackInner {
             warn!("iface {}: device refused a frame, dropping it", iface.handle.index());
         }
     }
+}
+
+/// Mark an ECN-capable IP packet CE while the interface's driver says the link is
+/// congested (RFC 3168 § 5), and pass its Traffic Class down in its metadata, so the
+/// driver needn't read its headers. `buf` starts at the IP header.
+#[cfg(feature = "traffic-class")]
+fn mark_and_tag(iface: &mut IfaceState<'_>, buf: &mut PacketBuf) {
+    let ect = |ecn: u8| matches!(ecn, 0b01 | 0b10);
+    let traffic_class = match IpVersion::of_packet(buf) {
+        #[cfg(feature = "ipv6")]
+        Ok(IpVersion::V6) => {
+            let mut packet = Ipv6Packet::new_unchecked(&mut buf[..]);
+            let mut traffic_class = packet.traffic_class();
+            if ect(traffic_class & 0b11) && iface.driver.congested() {
+                traffic_class |= 0b11;
+                packet.set_traffic_class(traffic_class);
+            }
+            traffic_class
+        }
+        #[cfg(feature = "ipv4")]
+        Ok(IpVersion::V4) => {
+            let checksum = !iface.checksum_caps().ipv4.tx;
+            let mut packet = Ipv4Packet::new_unchecked(&mut buf[..]);
+            if ect(packet.ecn()) && iface.driver.congested() {
+                packet.set_ecn(0b11);
+                if checksum {
+                    packet.fill_checksum();
+                }
+            }
+            packet.dscp() << 2 | packet.ecn()
+        }
+        _ => return,
+    };
+    buf.meta_mut().traffic_class = traffic_class;
 }
 
 /// The outermost header of a frame on an interface of this medium.

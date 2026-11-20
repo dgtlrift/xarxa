@@ -46,6 +46,11 @@ packetmeta-timestamp = ["packetmeta-id"]
 ## Losses are reported by the packet's transport and `PacketMeta::id`, so this
 ## implies `packetmeta-id`.
 local-loss = ["packetmeta-id"]
+## Enable the `PacketMeta::traffic_class` field, `Driver::congested` and
+## `Driver::congestion_seen`: the stack passes each packet's Traffic Class down, marks
+## ECN-capable packets CE while the driver says the link is congested, and tells the
+## driver of the CE marks it receives. No layer reads another's headers.
+traffic-class = []
 
 [dependencies]
 document-features = "0.2.11"
