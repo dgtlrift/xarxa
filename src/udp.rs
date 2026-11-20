@@ -289,12 +289,25 @@ pub struct RecvPacket {
     buf: PacketBuf,
     meta: UdpMetadata,
     payload: Range<usize>,
+    ecn: u8,
 }
 
 impl RecvPacket {
     fn new(mut buf: PacketBuf) -> Self {
         let (meta, payload) = parse_datagram(&mut buf);
-        Self { buf, meta, payload }
+        let ecn = match IpVersion::of_packet(&buf) {
+            #[cfg(feature = "ipv4")]
+            Ok(IpVersion::V4) => Ipv4Packet::new_unchecked(&mut buf[..]).ecn(),
+            #[cfg(feature = "ipv6")]
+            Ok(IpVersion::V6) => Ipv6Packet::new_unchecked(&mut buf[..]).traffic_class() & 0b11,
+            _ => 0,
+        };
+        Self {
+            buf,
+            meta,
+            payload,
+            ecn,
+        }
     }
 
     /// The datagram's metadata: remote and local address.
@@ -310,6 +323,13 @@ impl RecvPacket {
     /// The UDP payload, mutable.
     pub fn payload_mut(&mut self) -> &mut [u8] {
         &mut self.buf[self.payload.clone()]
+    }
+
+    /// The ECN field of the IP header the datagram came in (RFC 3168 § 5): 0 for
+    /// Not-ECT, 0b10 and 0b01 for ECT(0) and ECT(1), and 0b11 for CE, a mark of
+    /// congestion on the path that the application can react to.
+    pub fn ecn(&self) -> u8 {
+        self.ecn
     }
 }
 
@@ -2118,6 +2138,28 @@ mod test {
             let ip = Ipv4Packet::new_checked(&mut frames[2][..]).unwrap();
             assert_eq!((ip.dscp(), ip.ecn()), (46, 0b10));
             assert!(ip.verify_checksum());
+        }
+    }
+
+    #[test]
+    fn test_recv_ecn() {
+        // A received datagram reports the ECN field it came with.
+        let driver = TestDevice::new(Medium::Ip);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let iface = driver.install(&mut stack, HardwareAddress::Ip);
+        stack
+            .iface(iface)
+            .add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24))
+            .unwrap();
+        let handle = stack.add_udp_socket().unwrap();
+        let mut socket = stack.udp_socket(handle);
+        socket.bind(LOCAL_PORT, ANY).unwrap();
+
+        for ecn in [0, 0b10, 0b11] {
+            let mut buf = queued_packet(b"abcdef");
+            Ipv4Packet::new_unchecked(&mut buf[..]).set_ecn(ecn);
+            socket.inner_mut().rx_enqueue(buf);
+            assert_eq!(socket.recv().unwrap().ecn(), ecn);
         }
     }
 

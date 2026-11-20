@@ -56,6 +56,10 @@ use crate::storage::Assembler;
 /// `dispatch` caps it by the packet buffer, so a segment sized by it always fits one.
 const DEFAULT_IP_MTU: usize = 1500;
 
+/// The ECN field's ECT(0) and CE codepoints (RFC 3168 § 5).
+const ECN_ECT0: u8 = 0b10;
+const ECN_CE: u8 = 0b11;
+
 define_handle! {
     /// A handle to a TCP socket added to a [`Stack`].
     ///
@@ -487,6 +491,31 @@ pub(crate) enum ProcessResult {
     Rst,
 }
 
+/// A connection's Explicit Congestion Notification state (RFC 3168 § 6.1).
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, Default)]
+struct Ecn {
+    /// Whether the socket asks for ECN when it connects, and accepts it when it
+    /// accepts a connection.
+    enabled: bool,
+    /// Whether this connection negotiated ECN.
+    active: bool,
+    /// As the receiver: set ECE on each ACK until a segment with CWR arrives.
+    echo: bool,
+    /// As the sender: set CWR on the next new data segment.
+    send_cwr: bool,
+    /// As the sender: no further window reduction until an ACK passes this
+    /// sequence number.
+    recover: Option<TcpSeqNumber>,
+    /// The highest sequence number sent, which tells new data from
+    /// retransmissions.
+    high_seq: Option<TcpSeqNumber>,
+    /// Segments received marked CE, since the last `connect` or `accept`.
+    ce_received: u32,
+    /// Window reductions that ECE caused, since the last `connect` or `accept`.
+    ece_received: u32,
+}
+
 /// The state of a TCP socket, stored in the stack's socket slab. The public API
 /// lives on [`TcpSocket`], the view of one of these borrowed from the stack.
 #[derive(Debug)]
@@ -506,6 +535,8 @@ pub(crate) struct TcpSocketState<'d> {
     hop_limit: Option<u8>,
     /// The DSCP of outgoing segments (RFC 2474).
     dscp: u8,
+    /// Explicit Congestion Notification.
+    ecn: Ecn,
     /// Current 4-tuple (local and remote addresses).
     tuple: Option<Tuple>,
     /// The interface the socket is bound to. Zero-sized without `iface-bind`.
@@ -650,6 +681,7 @@ impl<'d> TcpSocketState<'d> {
             keep_alive: None,
             hop_limit: None,
             dscp: 0,
+            ecn: Ecn::default(),
             tuple: None,
             binding: IfaceBinding::Any,
             #[cfg(feature = "icmp-errors")]
@@ -783,6 +815,13 @@ impl<'d> TcpSocketState<'d> {
         {
             self.local_sack_history = [None, None, None];
         }
+        // ECN's setting and counters outlast the connection.
+        self.ecn = Ecn {
+            enabled: self.ecn.enabled,
+            ce_received: self.ecn.ce_received,
+            ece_received: self.ecn.ece_received,
+            ..Ecn::default()
+        };
 
         #[cfg(feature = "async")]
         {
@@ -812,6 +851,11 @@ impl<'d> TcpSocketState<'d> {
     }
 
     /// Number of octets transmitted but not yet ACKed.
+    fn ecn_usable(&self) -> bool {
+        // Without congestion control nothing could react to the marks.
+        self.ecn.enabled && cfg!(any(feature = "tcp-reno", feature = "tcp-cubic"))
+    }
+
     fn flight_size(&self) -> usize {
         self.send_next - self.send_unack
     }
@@ -855,6 +899,8 @@ impl<'d> TcpSocketState<'d> {
             window_len: 0,
             window_scale: None,
             max_seg_size: None,
+            ece: false,
+            cwr: false,
             #[cfg(feature = "tcp-sack")]
             sack_permitted: false,
             #[cfg(feature = "tcp-sack")]
@@ -957,11 +1003,14 @@ impl<'d> TcpSocketState<'d> {
     /// Returns what to answer it with right away. Nothing else is sent from here:
     /// the ACKs and data the segment calls for go out at the next
     /// [`dispatch`](Self::dispatch), later in the same poll.
+    ///
+    /// `ecn` is the ECN field of the IP header the segment came in.
     pub(crate) fn process(
         &mut self,
         now: Instant,
         src_addr: &IpAddr,
         dst_addr: &IpAddr,
+        ecn: u8,
         repr: &TcpRepr,
     ) -> ProcessResult {
         debug_assert!(self.accepts(src_addr, dst_addr, repr));
@@ -1276,6 +1325,9 @@ impl<'d> TcpSocketState<'d> {
                         self.congestion_controller.set_mss(self.send_mss);
                     }
                 }
+                // An ECN-setup SYN|ACK has ECE and not CWR (RFC 3168 § 6.1.1). A
+                // simultaneous open doesn't use ECN.
+                self.ecn.active = self.ecn_usable() && repr.ack_number.is_some() && repr.ece && !repr.cwr;
 
                 self.recv_read = repr.seq_number + 1;
                 self.send_next = self.send_unack + 1;
@@ -1457,6 +1509,20 @@ impl<'d> TcpSocketState<'d> {
                     .on_ack(now, ack_len, new_flight_size, &self.rtte);
             }
 
+            // RFC 3168 § 6.1.2: an ECE reduces the window at most once per window
+            // of data, and the next new data segment says so with CWR.
+            if self.ecn.active
+                && repr.ece
+                && repr.control != TcpControl::Syn
+                && self.ecn.recover.is_none_or(|recover| ack_number > recover)
+            {
+                debug!("received ECE, reducing the congestion window");
+                self.congestion_controller.on_ecn(now);
+                self.ecn.ece_received = self.ecn.ece_received.wrapping_add(1);
+                self.ecn.recover = Some(self.ecn.high_seq.unwrap_or(self.send_next));
+                self.ecn.send_cwr = true;
+            }
+
             // We've processed everything in the incoming segment, so advance the local
             // sequence number past it.
             self.send_unack = ack_number;
@@ -1468,6 +1534,19 @@ impl<'d> TcpSocketState<'d> {
             // deallocated from the buffer.
             if self.send_next < self.send_unack {
                 self.send_next = self.send_unack
+            }
+        }
+
+        // RFC 3168 § 6.1.3: the receiver echoes a CE mark with ECE until a CWR.
+        // A CWR and a CE mark on the same segment leave it echoing.
+        if self.ecn.active && repr.control != TcpControl::Syn {
+            if repr.cwr {
+                self.ecn.echo = false;
+            }
+            if ecn == ECN_CE {
+                trace!("received CE");
+                self.ecn.ce_received = self.ecn.ce_received.wrapping_add(1);
+                self.ecn.echo = true;
             }
         }
 
@@ -1917,16 +1996,16 @@ impl<'d> TcpSocketState<'d> {
         }
 
         let hop_limit = self.hop_limit.unwrap_or(64);
-        // The DSCP only: ECN on TCP needs its negotiation (RFC 3168 § 6.1.1).
-        let traffic_class = self.dscp << 2;
-        let mut send = |repr: TcpRepr| {
+        // The DSCP, and the ECN codepoint each segment is sent with.
+        let dscp = self.dscp << 2;
+        let mut send = |ecn: u8, repr: TcpRepr| {
             emit(
                 cx,
                 route,
                 tuple.local.addr,
                 tuple.remote.addr,
                 hop_limit,
-                traffic_class,
+                dscp | ecn,
                 repr,
             )
         };
@@ -1952,6 +2031,9 @@ impl<'d> TcpSocketState<'d> {
             window_len: self.scaled_window(),
             window_scale: None,
             max_seg_size: None,
+            // RFC 3168 § 6.1.3: echo a CE mark on each ACK until the peer's CWR.
+            ece: self.ecn.active && self.ecn.echo,
+            cwr: false,
             #[cfg(feature = "tcp-sack")]
             sack_permitted: false,
             // We fill blocks before payload sizing to ensure the options header
@@ -2013,6 +2095,11 @@ impl<'d> TcpSocketState<'d> {
                     if self.state == State::SynSent {
                         syn.ack_number = None;
                         syn.window_scale = Some(self.recv_window_shift);
+                        // An ECN-setup SYN (RFC 3168 § 6.1.1).
+                        if self.ecn_usable() {
+                            syn.ece = true;
+                            syn.cwr = true;
+                        }
                         #[cfg(feature = "tcp-sack")]
                         {
                             syn.sack_permitted = true;
@@ -2023,6 +2110,8 @@ impl<'d> TcpSocketState<'d> {
                             syn.sack_permitted = self.send_sack;
                         }
                         syn.window_scale = self.send_window_shift.map(|_| self.recv_window_shift);
+                        // An ECN-setup SYN|ACK.
+                        syn.ece = self.ecn.active;
                     }
                     self.send_segment(clock, &mut send, &syn, TcpControl::Syn, 0, 0)?;
                 }
@@ -2081,12 +2170,15 @@ impl<'d> TcpSocketState<'d> {
             trace!("sending a zero-window probe");
             let offset = self.flight_size();
             let payload = self.tx_buffer.get_allocated(offset, 1);
-            send(TcpRepr {
-                control: data_control(offset, payload.len()),
-                seq_number: self.send_next,
-                payload,
-                ..repr
-            })?;
+            send(
+                0,
+                TcpRepr {
+                    control: data_control(offset, payload.len()),
+                    seq_number: self.send_next,
+                    payload,
+                    ..repr
+                },
+            )?;
             self.ack_sent(repr.ack_number, repr.window_len);
             let delay = (delay * 2).min(RTTE_MAX_RTO);
             self.timer = Timer::ZeroWindowProbe {
@@ -2131,11 +2223,14 @@ impl<'d> TcpSocketState<'d> {
                 } =>
             {
                 trace!("sending a keep-alive");
-                send(TcpRepr {
-                    seq_number: self.send_next - 1,
-                    payload: b"\x00",
-                    ..repr
-                })?;
+                send(
+                    0,
+                    TcpRepr {
+                        seq_number: self.send_next - 1,
+                        payload: b"\x00",
+                        ..repr
+                    },
+                )?;
                 self.timer = Timer::Idle {
                     keep_alive_at: self.keep_alive.map(|interval| clock.after(interval)),
                 };
@@ -2158,7 +2253,7 @@ impl<'d> TcpSocketState<'d> {
     fn send_segment<E>(
         &mut self,
         clock: &mut Clock,
-        send: &mut impl FnMut(TcpRepr) -> Result<(), E>,
+        send: &mut impl FnMut(u8, TcpRepr) -> Result<(), E>,
         repr: &TcpRepr<'static>,
         control: TcpControl,
         offset: usize,
@@ -2172,13 +2267,29 @@ impl<'d> TcpSocketState<'d> {
         let payload2 = self
             .tx_buffer
             .get_allocated(offset + payload.len(), len - payload.len());
-        let repr = TcpRepr {
+        let mut repr = TcpRepr {
             control,
             seq_number: self.send_unack + offset,
             payload,
             payload2,
             ..*repr
         };
+
+        // On a connection that negotiated ECN, new data is ECN-capable, and the
+        // first after a window reduction carries CWR. Retransmissions, pure ACKs
+        // and SYNs aren't (RFC 3168 § 6.1.1, § 6.1.4 and § 6.1.5). An RST
+        // carries no ECE.
+        let mut ecn = 0;
+        if repr.control == TcpControl::Rst {
+            repr.ece = false;
+        } else if self.ecn.active
+            && repr.control != TcpControl::Syn
+            && repr.payload_len() != 0
+            && self.ecn.high_seq.is_none_or(|high| repr.seq_number >= high)
+        {
+            ecn = ECN_ECT0;
+            repr.cwr = self.ecn.send_cwr;
+        }
 
         // Trace a summary of what will be sent.
         if repr.payload_len() != 0 {
@@ -2204,9 +2315,15 @@ impl<'d> TcpSocketState<'d> {
         // Bailing out if the packet isn't placed in the device buffer allows us
         // to not waste time waiting for the retransmit timer on packets that we know
         // for sure will not be successfully transmitted.
-        send(repr)?;
+        send(ecn, repr)?;
         let segment_len = repr.segment_len();
         let seq_end = repr.seq_number + segment_len;
+        if repr.cwr {
+            self.ecn.send_cwr = false;
+        }
+        if segment_len > 0 {
+            self.ecn.high_seq = Some(self.ecn.high_seq.map_or(seq_end, |high| high.max(seq_end)));
+        }
 
         // Use max() so a fast-retransmit segment (whose seq_number is send_unack, well
         // behind the current frontier) doesn't rewind the tracked "highest sent" sequence.
@@ -2532,8 +2649,8 @@ impl<'d> TcpSocket<'_, 'd> {
 
     /// Set the DSCP of outgoing segments: the six high bits of the IPv6 Traffic
     /// Class or the IPv4 DS field (RFC 2474 § 3). It is 0, the default class,
-    /// unless set. Segments are not ECN-capable: that needs ECN's negotiation
-    /// (RFC 3168 § 6.1.1).
+    /// unless set. Segments are ECN-capable only on a connection that negotiated
+    /// ECN (see [`set_ecn_enabled`](Self::set_ecn_enabled)).
     ///
     /// # Errors
     /// - `InvalidDscp`: if `dscp` is above 63. The socket is left unchanged.
@@ -2543,6 +2660,43 @@ impl<'d> TcpSocket<'_, 'd> {
         }
         self.inner_mut().dscp = dscp;
         Ok(())
+    }
+
+    /// Enable or disable Explicit Congestion Notification (RFC 3168 § 6.1), off
+    /// by default.
+    ///
+    /// When enabled, the socket asks for ECN when it connects and accepts it on
+    /// a connection it accepts, if the stack has congestion control (the
+    /// `tcp-reno` or `tcp-cubic` feature): without it, nothing could react to
+    /// the marks. On a connection that negotiated ECN, new data segments are
+    /// sent ECN-capable (ECT(0)); a segment received marked CE is echoed with
+    /// ECE until the peer's CWR; and an ACK with ECE reduces the congestion
+    /// window as a loss would, at most once per window of data. The setting
+    /// applies from the next `connect` or `accept`.
+    pub fn set_ecn_enabled(&mut self, enabled: bool) {
+        self.inner_mut().ecn.enabled = enabled;
+    }
+
+    /// Return whether ECN is enabled. See [`set_ecn_enabled`](Self::set_ecn_enabled).
+    pub fn ecn_enabled(&self) -> bool {
+        self.inner().ecn.enabled
+    }
+
+    /// Return whether the current connection negotiated ECN.
+    pub fn ecn_active(&self) -> bool {
+        self.inner().ecn.active
+    }
+
+    /// Return how many segments arrived marked CE (Congestion Experienced) on a
+    /// connection that negotiated ECN, since the last `connect` or `accept`.
+    pub fn ce_received(&self) -> u32 {
+        self.inner().ecn.ce_received
+    }
+
+    /// Return how many times an ACK with ECE reduced the congestion window,
+    /// since the last `connect` or `accept`.
+    pub fn ece_received(&self) -> u32 {
+        self.inner().ecn.ece_received
     }
 
     /// Bind the socket to an interface, or unbind it with `None`.
@@ -2683,6 +2837,8 @@ impl<'d> TcpSocket<'_, 'd> {
 
         let s = self.inner_mut();
         s.reset();
+        s.ecn.ce_received = 0;
+        s.ecn.ece_received = 0;
         s.tuple = Some(Tuple {
             local: local_addr,
             remote,
@@ -2721,6 +2877,8 @@ impl<'d> TcpSocket<'_, 'd> {
         }
         let s = self.sockets.get_mut(self.index);
         s.reset();
+        s.ecn.ce_received = 0;
+        s.ecn.ece_received = 0;
         token.start_syn_received(s, self.tx.rand());
         Ok(())
     }
@@ -3108,6 +3266,8 @@ mod test {
         window_len: 256,
         window_scale: None,
         max_seg_size: None,
+        ece: false,
+        cwr: false,
         #[cfg(feature = "tcp-sack")]
         sack_permitted: false,
         #[cfg(feature = "tcp-sack")]
@@ -3126,6 +3286,8 @@ mod test {
         window_len: 64,
         window_scale: None,
         max_seg_size: None,
+        ece: false,
+        cwr: false,
         #[cfg(feature = "tcp-sack")]
         sack_permitted: false,
         #[cfg(feature = "tcp-sack")]
@@ -3174,13 +3336,23 @@ mod test {
     /// Everything else it calls for goes out at the next dispatch.
     #[track_caller]
     fn send(socket: &mut TestSocket, timestamp: Instant, repr: &TcpRepr) -> Option<TcpRepr<'static>> {
+        send_ecn(socket, timestamp, 0, repr)
+    }
+
+    /// Like [`send`], in a packet whose ECN field is `ecn`.
+    #[track_caller]
+    fn send_ecn(socket: &mut TestSocket, timestamp: Instant, ecn: u8, repr: &TcpRepr) -> Option<TcpRepr<'static>> {
         let src_addr = IpAddr::from(REMOTE_ADDR);
         let dst_addr = IpAddr::from(LOCAL_ADDR);
         trace!("send: {}", repr);
 
         assert!(socket.sockets.get_mut(0).accepts(&src_addr, &dst_addr, repr));
 
-        match socket.sockets.get_mut(0).process(timestamp, &src_addr, &dst_addr, repr) {
+        match socket
+            .sockets
+            .get_mut(0)
+            .process(timestamp, &src_addr, &dst_addr, ecn, repr)
+        {
             ProcessResult::None => None,
             ProcessResult::Rst => {
                 let repr = TcpSocketState::rst_reply(repr);
@@ -12600,6 +12772,206 @@ mod test {
             ..RECV_TEMPL
         }));
     }
+
+    // =========================================================================================//
+    // Tests for ECN (RFC 3168 § 6.1).
+    // =========================================================================================//
+
+    /// Dispatch at `time` (in milliseconds), and return the Traffic Class, ECE,
+    /// CWR and payload length of each segment sent.
+    fn ecn_recv(s: &mut TestSocket, time: u32) -> Vec<(u8, bool, bool, usize)> {
+        let mut sent = Vec::new();
+        let result: Result<(), ()> = s.sockets.get_mut(0).dispatch(
+            &mut s.stack.tx_context(),
+            &mut Clock::new(Instant::from_millis(time)),
+            |_, _route, _src_addr, _dst_addr, _hop_limit, traffic_class, repr| {
+                sent.push((traffic_class, repr.ece, repr.cwr, repr.payload_len()));
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        sent
+    }
+
+    /// An established connection that negotiated ECN, with a small MSS so that
+    /// the window can be reduced, and without Nagle's algorithm.
+    #[cfg(any(feature = "tcp-reno", feature = "tcp-cubic"))]
+    fn socket_established_ecn() -> TestSocket {
+        let mut s = socket_established_with_buffer_sizes(256, 256);
+        s.ecn.enabled = true;
+        s.ecn.active = true;
+        s.congestion_controller.set_mss(16);
+        s.nagle = false;
+        s
+    }
+
+    #[test]
+    #[cfg(any(feature = "tcp-reno", feature = "tcp-cubic"))]
+    fn test_ecn_active_open() {
+        // Off by default: a plain SYN.
+        let mut s = socket_syn_sent();
+        assert!(!s.view().ecn_enabled());
+        assert_eq!(ecn_recv(&mut s, 0), [(0, false, false, 0)]);
+
+        // Enabled: an ECN-setup SYN, and ECN in use if the SYN|ACK has ECE and
+        // not CWR.
+        for (ece, cwr, active) in [(true, false, true), (false, false, false), (true, true, false)] {
+            let mut s = socket_syn_sent();
+            s.view().set_ecn_enabled(true);
+            assert_eq!(ecn_recv(&mut s, 0), [(0, true, true, 0)]);
+            send!(
+                s,
+                TcpRepr {
+                    control: TcpControl::Syn,
+                    seq_number: REMOTE_SEQ,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    max_seg_size: Some(BASE_MSS - 80),
+                    window_scale: Some(0),
+                    ece,
+                    cwr,
+                    ..SEND_TEMPL
+                }
+            );
+            assert_eq!(s.state, State::Established);
+            assert_eq!(s.view().ecn_active(), active);
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "tcp-listener", any(feature = "tcp-reno", feature = "tcp-cubic")))]
+    fn test_ecn_passive_open() {
+        for (enabled, asked, active) in [(true, true, true), (true, false, false), (false, true, false)] {
+            let (mut stack, h) = listener_stack();
+            let syn = TcpRepr {
+                ece: asked,
+                cwr: asked,
+                ..syn_repr()
+            };
+            assert!(listener_deliver(&mut stack, &syn));
+            let token = stack.tcp_listener(h).accept().unwrap();
+            let sh = stack
+                .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+                .unwrap();
+            stack.tcp_socket(sh).set_ecn_enabled(enabled);
+            stack.tcp_socket(sh).accept(token).unwrap();
+            assert_eq!(stack.tcp_socket(sh).ecn_active(), active);
+            let mut s = TestSocket {
+                sockets: {
+                    let mut sockets = Slab::new();
+                    sockets.add_with(|_| stack.sockets.tcp.take(sh.index())).unwrap();
+                    sockets
+                },
+                stack,
+                deadline: idle_deadline(Instant::ZERO),
+            };
+            // An ECN-setup SYN|ACK has ECE and not CWR.
+            assert_eq!(ecn_recv(&mut s, 0), [(0, active, false, 0)]);
+        }
+    }
+
+    #[test]
+    fn test_ecn_needs_congestion_control() {
+        // Without a congestion controller nothing could react to the marks, so
+        // the SYN doesn't ask for ECN.
+        let mut s = socket_syn_sent();
+        s.view().set_ecn_enabled(true);
+        let asked = cfg!(any(feature = "tcp-reno", feature = "tcp-cubic"));
+        assert_eq!(ecn_recv(&mut s, 0), [(0, asked, asked, 0)]);
+    }
+
+    #[test]
+    #[cfg(any(feature = "tcp-reno", feature = "tcp-cubic"))]
+    fn test_ecn_sender_reduces_once_per_window() {
+        let mut s = socket_established_ecn();
+        s.view().send_slice(b"abcdef").unwrap();
+        assert_eq!(ecn_recv(&mut s, 0), [(0b10, false, false, 6)]);
+
+        // An ACK with ECE reduces the window, once.
+        let before = s.congestion_controller.window();
+        let ack = TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 6),
+            ece: true,
+            ..SEND_TEMPL
+        };
+        send!(s, time 10, ack);
+        assert_eq!(s.view().ece_received(), 1);
+        assert!(s.congestion_controller.window() < before);
+
+        // The next new data carries CWR, and only it.
+        s.view().send_slice(b"ghi").unwrap();
+        assert_eq!(ecn_recv(&mut s, 20), [(0b10, false, true, 3)]);
+        s.view().send_slice(b"jk").unwrap();
+        assert_eq!(ecn_recv(&mut s, 30), [(0b10, false, false, 2)]);
+
+        // More ECE before the reduction's window is acknowledged: no further
+        // reduction.
+        send!(s, time 40, ack);
+        assert_eq!(s.view().ece_received(), 1);
+
+        // ECE on an ACK past the reduction's window: another.
+        send!(
+            s,
+            time 50,
+            TcpRepr {
+                ack_number: Some(LOCAL_SEQ + 1 + 11),
+                ..ack
+            }
+        );
+        assert_eq!(s.view().ece_received(), 2);
+    }
+
+    #[test]
+    #[cfg(any(feature = "tcp-reno", feature = "tcp-cubic"))]
+    fn test_ecn_receiver_echoes_ce_until_cwr() {
+        let mut s = socket_established_ecn();
+        let data = |seq: usize, payload: &'static [u8], cwr| TcpRepr {
+            seq_number: REMOTE_SEQ + 1 + seq,
+            ack_number: Some(LOCAL_SEQ + 1),
+            cwr,
+            payload,
+            ..SEND_TEMPL
+        };
+        // CE: echoed on every ACK...
+        send_ecn(&mut s, Instant::from_millis(0), 0b11, &data(0, b"abc", false));
+        assert_eq!(s.view().ce_received(), 1);
+        assert_eq!(ecn_recv(&mut s, 0), [(0, true, false, 0)]);
+        send_ecn(&mut s, Instant::from_millis(10), 0b10, &data(3, b"def", false));
+        assert_eq!(ecn_recv(&mut s, 10), [(0, true, false, 0)]);
+        // ...until a CWR.
+        send_ecn(&mut s, Instant::from_millis(20), 0b10, &data(6, b"ghi", true));
+        assert_eq!(ecn_recv(&mut s, 20), [(0, false, false, 0)]);
+        assert_eq!(s.view().ce_received(), 1);
+
+        // The counters start over with the next connection, and the setting stays.
+        s.reset();
+        assert_eq!(s.view().ce_received(), 1);
+        assert!(s.view().ecn_enabled() && !s.view().ecn_active());
+    }
+
+    #[test]
+    #[cfg(any(feature = "tcp-reno", feature = "tcp-cubic"))]
+    fn test_ecn_marks_new_data_only() {
+        let mut s = socket_established_ecn();
+        s.view().set_dscp(46).unwrap();
+        s.view().send_slice(b"abcdef").unwrap();
+        // New data: ECT(0), with the DSCP.
+        assert_eq!(ecn_recv(&mut s, 0), [(46 << 2 | 0b10, false, false, 6)]);
+        // Its retransmission, when the timer expires: not ECN-capable.
+        assert_eq!(ecn_recv(&mut s, 2000), [(46 << 2, false, false, 6)]);
+        // Nor is a pure ACK.
+        send!(
+            s,
+            time 2100,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 6),
+                payload: b"x",
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(ecn_recv(&mut s, 2100), [(46 << 2, false, false, 0)]);
+    }
 }
 
 #[cfg(all(test, feature = "medium-ip", feature = "ipv4"))]
@@ -12633,6 +13005,8 @@ mod stack_test {
         window_len: 1024,
         window_scale: None,
         max_seg_size: None,
+        ece: false,
+        cwr: false,
         #[cfg(feature = "tcp-sack")]
         sack_permitted: false,
         #[cfg(feature = "tcp-sack")]

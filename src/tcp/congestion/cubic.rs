@@ -210,6 +210,25 @@ impl Controller for Cubic {
         }
     }
 
+    fn on_ecn(&mut self, now: Instant) {
+        // RFC 9438 § 4.6 and RFC 3168 § 6.1.2: a CE mark is a congestion event
+        // like a loss, but nothing is retransmitted, so there is no fast
+        // recovery: the window drops to the new threshold at once.
+        self.idle_start = None;
+        self.cwnd_prior = self.cwnd;
+        // RFC 9438 § 4.7: fast convergence, as on a loss.
+        self.w_max = if self.cwnd < self.w_max {
+            ((self.cwnd as f64) * (1.0 + BETA_CUBIC) / 2.0) as usize
+        } else {
+            self.cwnd
+        };
+        self.ssthresh = ((self.cwnd as f64 * BETA_CUBIC) as usize).max(2 * self.mss);
+        self.cwnd = self.ssthresh.min(self.rwnd);
+        self.w_est = self.cwnd as f64;
+        self.recovery_start = Some(now);
+        self.recompute_k();
+    }
+
     fn on_rto(&mut self, _now: Instant, in_flight: usize) {
         // RFC 5681: when the retransmission timer fires for a segment that has
         // already been retransmitted by the timer (no new data was ACKed since
