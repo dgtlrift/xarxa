@@ -39,6 +39,11 @@ pub type Sent = Rc<RefCell<Vec<Vec<u8>>>>;
 #[cfg(feature = "packetmeta-id")]
 pub type SentMeta = Rc<RefCell<Vec<PacketMeta>>>;
 
+/// Whether the device says the link is congested, and how many CE marks the stack
+/// reported to it, shared with the test.
+#[cfg(feature = "traffic-class")]
+pub type Congestion = Rc<Cell<(bool, u32)>>;
+
 /// How many more frames the device accepts. `None` is unlimited.
 pub type Room = Rc<Cell<Option<usize>>>;
 
@@ -95,6 +100,9 @@ pub struct TestDevice {
     /// Transmit timestamps not yet polled.
     #[cfg(feature = "packetmeta-timestamp")]
     tx_stamps: VecDeque<TxTimestamp>,
+    /// Whether it reports congestion, and the CE marks reported to it.
+    #[cfg(feature = "traffic-class")]
+    pub congestion: Congestion,
 }
 
 impl TestDevice {
@@ -132,6 +140,8 @@ impl TestDevice {
             tx_stamp: None,
             #[cfg(feature = "packetmeta-timestamp")]
             tx_stamps: VecDeque::new(),
+            #[cfg(feature = "traffic-class")]
+            congestion: Rc::new(Cell::new((false, 0))),
         }
     }
 
@@ -261,5 +271,16 @@ impl Driver for TestDevice {
 
     fn set_multicast_filter(&mut self, addrs: &[[u8; 6]]) {
         self.mcast_filter.borrow_mut().push(addrs.to_vec());
+    }
+
+    #[cfg(feature = "traffic-class")]
+    fn congested(&mut self) -> bool {
+        self.congestion.get().0
+    }
+
+    #[cfg(feature = "traffic-class")]
+    fn congestion_seen(&mut self) {
+        let (congested, seen) = self.congestion.get();
+        self.congestion.set((congested, seen + 1));
     }
 }

@@ -99,6 +99,16 @@ pub struct PacketMeta {
     /// them to be dropped.
     #[cfg(feature = "packetmeta-timestamp")]
     pub request_timestamp: bool,
+
+    /// The packet's IPv6 Traffic Class, or IPv4's DS field: its DSCP in the six high
+    /// bits, and its ECN field in the two low ones (RFC 2474, RFC 3168), CE included if
+    /// the stack marked it.
+    ///
+    /// Set by the stack on every IP packet it transmits, and copied to each of its link
+    /// fragments, so that a driver can pick a link-layer class for it without reading
+    /// its headers. Meaningful on packets to transmit only. Defaults to `0`.
+    #[cfg(feature = "traffic-class")]
+    pub traffic_class: u8,
 }
 
 /// The timestamp of a transmitted packet, reported by

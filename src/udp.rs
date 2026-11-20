@@ -2121,6 +2121,70 @@ mod test {
         }
     }
 
+    /// Option A (the Traffic Class down, CE at IP): a packet's Traffic Class reaches the
+    /// driver in its metadata, an ECN-capable packet is marked CE while the driver says
+    /// the link is congested, and a received CE mark is reported to the driver.
+    #[cfg(feature = "traffic-class")]
+    #[test]
+    fn test_congestion_marks_and_hints() {
+        let driver = TestDevice::new(Medium::Ip);
+        let tx = driver.tx.clone();
+        let tx_meta = driver.tx_meta.clone();
+        let rx = driver.rx.clone();
+        let congestion = driver.congestion.clone();
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let iface = driver.install(&mut stack, HardwareAddress::Ip);
+        stack
+            .iface(iface)
+            .add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24))
+            .unwrap();
+        stack
+            .iface(iface)
+            .add_ip_addr(IpCidr::new(LOCAL_ADDR_V6.into(), 64))
+            .unwrap();
+        tx.borrow_mut().clear();
+        tx_meta.borrow_mut().clear();
+
+        let handle = stack.add_udp_socket().unwrap();
+        let mut socket = stack.udp_socket(handle);
+        socket.bind(LOCAL_PORT, ANY).unwrap();
+        socket.set_dscp(46).unwrap();
+        socket.set_ecn_capable(true);
+        // Not congested: ECT(0), as the socket sent it.
+        socket.send_slice(b"abc", (REMOTE_ADDR_V6, REMOTE_PORT)).unwrap();
+        // Congested: CE, in both versions.
+        congestion.set((true, 0));
+        socket.send_slice(b"abc", (REMOTE_ADDR_V6, REMOTE_PORT)).unwrap();
+        socket.send_slice(b"abc", (REMOTE_ADDR, REMOTE_PORT)).unwrap();
+        // A packet that isn't ECN-capable isn't marked.
+        socket.set_ecn_capable(false);
+        socket.send_slice(b"abc", (REMOTE_ADDR_V6, REMOTE_PORT)).unwrap();
+        {
+            let mut frames = tx.borrow_mut();
+            assert_eq!(frames.len(), 4);
+            let tc = |frame: &mut Vec<u8>| Ipv6Packet::new_checked(&mut frame[..]).unwrap().traffic_class();
+            assert_eq!(tc(&mut frames[0]), 46 << 2 | 0b10);
+            assert_eq!(tc(&mut frames[1]), 46 << 2 | 0b11);
+            let ip = Ipv4Packet::new_checked(&mut frames[2][..]).unwrap();
+            assert_eq!((ip.dscp(), ip.ecn()), (46, 0b11));
+            assert!(ip.verify_checksum());
+            assert_eq!(tc(&mut frames[3]), 46 << 2);
+            let meta: Vec<u8> = tx_meta.borrow().iter().map(|m| m.traffic_class).collect();
+            assert_eq!(meta, [46 << 2 | 0b10, 46 << 2 | 0b11, 46 << 2 | 0b11, 46 << 2]);
+        }
+
+        // A received CE mark is reported to the driver; ECT(0) isn't.
+        for ecn in [0b11, 0b10] {
+            let mut buf = queued_packet(b"abcdef");
+            let mut ip = Ipv4Packet::new_unchecked(&mut buf[..]);
+            ip.set_ecn(ecn);
+            ip.fill_checksum();
+            rx.borrow_mut().push_back(buf.to_vec());
+        }
+        stack.poll(crate::time::Instant::from_millis(0));
+        assert_eq!(congestion.get(), (true, 1));
+    }
+
     #[test]
     fn test_set_hop_limit() {
         // The socket's hop limit ends up in the IP header of every datagram it

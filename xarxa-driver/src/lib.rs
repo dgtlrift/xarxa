@@ -333,6 +333,25 @@ pub trait Driver {
         None
     }
 
+    /// Whether the link is congested right now: its queue at the driver's threshold, or
+    /// its airtime near a duty-cycle limit, as the link layer judges it.
+    ///
+    /// The stack asks before sending each IP packet, and marks an ECN-capable one CE
+    /// while this is true (RFC 3168 § 5), its own packets and forwarded ones alike: the
+    /// link's queue management, done at enqueue. Drivers that cannot tell return `false`,
+    /// which is the default implementation.
+    #[cfg(feature = "traffic-class")]
+    fn congested(&mut self) -> bool {
+        false
+    }
+
+    /// The stack received a packet marked CE on this link.
+    ///
+    /// A hint for the link layer, which may react to congestion seen downstream, such
+    /// as by backing off further. The default implementation ignores it.
+    #[cfg(feature = "traffic-class")]
+    fn congestion_seen(&mut self) {}
+
     /// Set the device's multicast hardware address filter.
     ///
     /// `addrs` is the full list of multicast MAC addresses to listen on. It
@@ -388,6 +407,14 @@ impl<T: Driver + ?Sized> Driver for &mut T {
     #[cfg(feature = "packetmeta-timestamp")]
     fn poll_tx_timestamp(&mut self) -> Option<TxTimestamp> {
         T::poll_tx_timestamp(self)
+    }
+    #[cfg(feature = "traffic-class")]
+    fn congested(&mut self) -> bool {
+        T::congested(self)
+    }
+    #[cfg(feature = "traffic-class")]
+    fn congestion_seen(&mut self) {
+        T::congestion_seen(self)
     }
     fn set_multicast_filter(&mut self, addrs: &[[u8; 6]]) {
         T::set_multicast_filter(self, addrs)
