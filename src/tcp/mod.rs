@@ -7887,6 +7887,39 @@ mod test {
         }));
     }
 
+    /// A fast retransmit drops the RTT sample being taken (Karn's algorithm),
+    /// but doesn't back the retransmission timer off: RFC 6298 § 5.5 does that
+    /// only when the timer expires.
+    #[test]
+    fn test_fast_retransmit_keeps_the_timer() {
+        let mut s = socket_established();
+        s.view().send_slice(b"xxxxxxyyyyyy").unwrap();
+        recv!(s, time 1000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"xxxxxxyyyyyy"[..],
+            ..RECV_TEMPL
+        }));
+        let rto = s.rtte.retransmission_timeout();
+        // The first ACK sets the ACK the next three duplicate.
+        for t in [1040, 1050, 1055, 1060] {
+            send!(s, time t, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            });
+        }
+        // The fast retransmit resends, without backing the timer off.
+        recv!(s, time 1100, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"xxxxxxyyyyyy"[..],
+            ..RECV_TEMPL
+        }));
+        assert_eq!(s.rtte.retransmission_timeout(), rto);
+        assert!(s.rtte.timestamp.is_none());
+    }
+
     #[test]
     fn test_fast_retransmit_after_triple_duplicate_ack() {
         let mut s = socket_established();
