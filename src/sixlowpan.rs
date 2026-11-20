@@ -6,6 +6,10 @@
 //! happen in place, in the packet's own buffer: the compressed header chain is
 //! written into the space the uncompressed one occupied, and the other way
 //! around, with the headroom taking up the difference.
+//!
+//! [`compress`] and [`decompress`] are the same compression for a 6LoWPAN layer
+//! outside the stack, such as one under a `Medium::Ip` interface that sends over
+//! a link the stack doesn't drive itself.
 
 use crate::config::SIXLOWPAN_ADDRESS_CONTEXT_COUNT;
 use crate::driver::PacketBuf;
@@ -583,6 +587,54 @@ pub(crate) fn ipv6_to_sixlowpan(buf: &mut PacketBuf, ieee_repr: &Ieee802154Repr)
 }
 
 // Egress.
+/// Compress the IPv6 packet in `buf` in place to a 6LoWPAN packet (RFC 6282), as
+/// sent from link address `ll_src` to `ll_dst`: the IPv6 header and the extension
+/// and UDP headers that follow become IPHC and NHC, eliding what the link addresses
+/// imply.
+///
+/// Returns how much shorter the header chain became, which RFC 4944
+/// fragmentation needs for its offsets.
+///
+/// # Errors
+/// - `Malformed`: if `buf` isn't a valid IPv6 packet.
+pub fn compress(buf: &mut PacketBuf, ll_src: Ieee802154Address, ll_dst: Ieee802154Address) -> Result<usize, Malformed> {
+    let repr = Ieee802154Repr {
+        frame_type: Ieee802154FrameType::Data,
+        security_enabled: false,
+        frame_pending: false,
+        ack_request: false,
+        sequence_number: None,
+        pan_id_compression: true,
+        frame_version: Ieee802154FrameVersion::Ieee802154_2006,
+        dst_pan_id: None,
+        dst_addr: Some(ll_dst),
+        src_pan_id: None,
+        src_addr: Some(ll_src),
+    };
+    ipv6_to_sixlowpan(buf, &repr)
+}
+
+/// Decompress the 6LoWPAN packet in `buf`, IPHC first, in place to an IPv6
+/// packet (RFC 6282), as received from link address `ll_src` at `ll_dst`, with
+/// the stateful-compression contexts `contexts`.
+///
+/// `total_len` is the whole IPv6 packet's length when `buf` is the first
+/// fragment of one (RFC 4944 § 5.3), and `None` for a whole packet. The headroom
+/// is made if it is short.
+///
+/// # Errors
+/// - `Malformed`: if `buf` isn't a valid 6LoWPAN packet, or names a context it
+///   wasn't given.
+pub fn decompress(
+    buf: &mut PacketBuf,
+    ll_src: Option<Ieee802154Address>,
+    ll_dst: Option<Ieee802154Address>,
+    contexts: &[SixlowpanAddressContext],
+    total_len: Option<usize>,
+) -> Result<(), Malformed> {
+    sixlowpan_to_ipv6(buf, ll_src, ll_dst, contexts, total_len)
+}
+
 impl StackInner {
     /// Send an IPv6 packet to `ll_dst_a` on an IEEE 802.15.4 interface.
     pub(crate) fn dispatch_ieee802154(
@@ -1028,7 +1080,8 @@ mod test {
         buf.reserve(headroom);
         buf.set_len(packet.len());
         buf.copy_from_slice(packet);
-        let header_diff = ipv6_to_sixlowpan(&mut buf, &mac_repr(src, dst, None)).unwrap();
+        // Through the public API, which the stack's own medium shares.
+        let header_diff = super::compress(&mut buf, src, dst).unwrap();
         (buf.to_vec(), header_diff)
     }
 
@@ -1046,7 +1099,7 @@ mod test {
         buf.reserve(headroom);
         buf.set_len(payload.len());
         buf.copy_from_slice(payload);
-        sixlowpan_to_ipv6(&mut buf, Some(src), Some(dst), context, total_len)?;
+        super::decompress(&mut buf, Some(src), Some(dst), context, total_len)?;
         Ok(buf.to_vec())
     }
 
