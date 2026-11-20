@@ -5,6 +5,7 @@
 // Consult RFC 7414 when implementing a new feature.
 
 use core::fmt::Display;
+use core::num::NonZeroU16;
 use core::{fmt, mem};
 
 #[cfg(all(test, feature = "tcp-listener"))]
@@ -537,6 +538,9 @@ pub(crate) struct TcpSocketState<'d> {
     dscp: u8,
     /// Explicit Congestion Notification.
     ecn: Ecn,
+    /// The cap on the segment size, sent and advertised, if one is set. User
+    /// configuration, kept across `reset` like the hop limit.
+    max_seg_size: Option<NonZeroU16>,
     /// Current 4-tuple (local and remote addresses).
     tuple: Option<Tuple>,
     /// The interface the socket is bound to. Zero-sized without `iface-bind`.
@@ -682,6 +686,7 @@ impl<'d> TcpSocketState<'d> {
             hop_limit: None,
             dscp: 0,
             ecn: Ecn::default(),
+            max_seg_size: None,
             tuple: None,
             binding: IfaceBinding::Any,
             #[cfg(feature = "icmp-errors")]
@@ -854,6 +859,15 @@ impl<'d> TcpSocketState<'d> {
     fn ecn_usable(&self) -> bool {
         // Without congestion control nothing could react to the marks.
         self.ecn.enabled && cfg!(any(feature = "tcp-reno", feature = "tcp-cubic"))
+    }
+
+    /// Cap SendMSS by the socket's own cap, if it has one, and size the
+    /// congestion window by the capped segment.
+    pub(crate) fn cap_send_mss(&mut self) {
+        if let Some(cap) = self.max_seg_size {
+            self.send_mss = self.send_mss.min(usize::from(cap.get()));
+            self.congestion_controller.set_mss(self.send_mss);
+        }
     }
 
     fn flight_size(&self) -> usize {
@@ -1328,6 +1342,7 @@ impl<'d> TcpSocketState<'d> {
                 // An ECN-setup SYN|ACK has ECE and not CWR (RFC 3168 § 6.1.1). A
                 // simultaneous open doesn't use ECN.
                 self.ecn.active = self.ecn_usable() && repr.ack_number.is_some() && repr.ece && !repr.cwr;
+                self.cap_send_mss();
 
                 self.recv_read = repr.seq_number + 1;
                 self.send_next = self.send_unack + 1;
@@ -2018,7 +2033,10 @@ impl<'d> TcpSocketState<'d> {
             #[cfg(feature = "ipv6")]
             IpAddr::V6(_) => IPV6_HEADER_LEN,
         };
-        let local_mss = self.ip_mtu - ip_header_len - TCP_HEADER_LEN;
+        let mut local_mss = self.ip_mtu - ip_header_len - TCP_HEADER_LEN;
+        if let Some(cap) = self.max_seg_size {
+            local_mss = local_mss.min(usize::from(cap.get()));
+        }
 
         // Every segment starts out as an empty ACK.
         let ack = self.recv_read + self.rx_buffer.len();
@@ -2629,6 +2647,25 @@ impl<'d> TcpSocket<'_, 'd> {
     /// See also the [set_hop_limit](#method.set_hop_limit) method
     pub fn hop_limit(&self) -> Option<u8> {
         self.inner().hop_limit
+    }
+
+    /// Return the cap on the segment size, if one is set.
+    ///
+    /// See also the [set_max_segment_size](#method.set_max_segment_size) method.
+    pub fn max_segment_size(&self) -> Option<NonZeroU16> {
+        self.inner().max_seg_size
+    }
+
+    /// Cap the TCP segment size: the MSS this socket advertises in its SYN or
+    /// SYN|ACK, and the largest segment it sends, below the peer's MSS. The
+    /// congestion window is sized by the capped segment. `None`, the default,
+    /// leaves the size to the IP MTU of the route.
+    ///
+    /// A cap lets each segment fit one link-layer frame where the IP MTU is
+    /// larger than a frame, as over 6LoWPAN, so that no segment is fragmented.
+    /// It applies from the next `connect` or `accept`.
+    pub fn set_max_segment_size(&mut self, max_seg_size: Option<NonZeroU16>) {
+        self.inner_mut().max_seg_size = max_seg_size;
     }
 
     /// Set the time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -13028,6 +13065,67 @@ mod test {
         // The window itself hasn't changed: nothing more goes out.
         assert_eq!(s.congestion_controller.window(), 64);
         assert_eq!(flight(&mut s, 30), 0);
+    }
+
+    // =========================================================================================//
+    // Tests for the segment size cap.
+    // =========================================================================================//
+
+    /// Dispatch at `time` (in milliseconds), and return the MSS option and the
+    /// payload length of each segment sent.
+    fn mss_recv(s: &mut TestSocket, time: u32) -> Vec<(Option<u16>, usize)> {
+        let mut sent = Vec::new();
+        let result: Result<(), ()> = s.sockets.get_mut(0).dispatch(
+            &mut s.stack.tx_context(),
+            &mut Clock::new(Instant::from_millis(time)),
+            |_, _route, _src_addr, _dst_addr, _hop_limit, _traffic_class, repr| {
+                sent.push((repr.max_seg_size, repr.payload_len()));
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        sent
+    }
+
+    #[test]
+    fn test_max_segment_size_advertised_and_applied() {
+        let cap = NonZeroU16::new(40);
+        let mut s = socket_syn_sent();
+        assert_eq!(s.view().max_segment_size(), None);
+        s.view().set_max_segment_size(cap);
+        assert_eq!(s.view().max_segment_size(), cap);
+        // The SYN advertises the cap.
+        assert_eq!(mss_recv(&mut s, 0), [(Some(40), 0)]);
+        // The peer's larger MSS is capped too.
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: Some(LOCAL_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+        assert_eq!(s.send_mss, 40);
+    }
+
+    #[test]
+    fn test_max_segment_size_caps_segments() {
+        let mut s = socket_established_with_buffer_sizes(256, 64);
+        s.nagle = false;
+        s.send_mss = usize::from(BASE_MSS);
+        s.view().set_max_segment_size(NonZeroU16::new(40));
+        s.cap_send_mss();
+        s.view().send_slice(&[0x55; 100]).unwrap();
+        assert_eq!(mss_recv(&mut s, 0), [(None, 40), (None, 40), (None, 20)]);
+
+        // Without a cap, the segment is as large as the MTU allows.
+        let mut s = socket_established_with_buffer_sizes(256, 64);
+        s.send_mss = usize::from(BASE_MSS);
+        s.view().send_slice(&[0x55; 100]).unwrap();
+        assert_eq!(mss_recv(&mut s, 0), [(None, 100)]);
     }
 }
 

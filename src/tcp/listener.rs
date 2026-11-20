@@ -256,6 +256,7 @@ impl AcceptToken {
         s.send_mss = syn.send_mss;
         s.congestion_controller.set_mss(syn.send_mss);
         s.ecn.active = s.ecn_usable() && syn.ecn_setup;
+        s.cap_send_mss();
         // Answer with timestamps only if the SYN offered them.
         #[cfg(feature = "tcp-timestamps")]
         {
