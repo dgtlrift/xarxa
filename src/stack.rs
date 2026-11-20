@@ -3041,9 +3041,18 @@ impl StackInner {
         iface: &mut IfaceState<'_>,
         dst_addr: IpAddr,
         next_hop: IpAddr,
-        #[cfg_attr(not(feature = "traffic-class"), allow(unused_mut))] mut buf: PacketBuf,
+        #[cfg_attr(not(any(feature = "traffic-class", feature = "packetmeta-next-hop")), allow(unused_mut))] mut buf: PacketBuf,
         ethertype: EthernetProtocol,
     ) {
+        #[cfg(feature = "packetmeta-next-hop")]
+        {
+            buf.meta_mut().next_hop = Some(match next_hop {
+                #[cfg(feature = "ipv4")]
+                IpAddr::V4(a) => core::net::IpAddr::V4(a),
+                #[cfg(feature = "ipv6")]
+                IpAddr::V6(a) => core::net::IpAddr::V6(a),
+            });
+        }
         #[cfg(feature = "traffic-class")]
         mark_and_tag(iface, &mut buf);
 

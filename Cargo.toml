@@ -59,6 +59,7 @@ default = [
     "packetmeta-timestamp",
     "local-loss",
     "traffic-class",
+    "packetmeta-next-hop",
 ]
 
 ## Use the heap. Used for:
@@ -170,6 +171,9 @@ local-loss = ["packetmeta-id", "xarxa-driver/local-loss"]
 ## and tell the driver of received CE marks (`Driver::congested`,
 ## `Driver::congestion_seen`).
 traffic-class = ["xarxa-driver/traffic-class"]
+## Put each packet's next hop in its `PacketMeta`, for a driver that resolves link
+## addresses itself.
+packetmeta-next-hop = ["xarxa-driver/packetmeta-next-hop"]
 
 #! ### Logging
 ## Log with the `log` crate.

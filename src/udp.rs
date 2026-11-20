@@ -1864,7 +1864,14 @@ mod test {
         socket
             .send_slice(b"hi", SocketAddr::new(REMOTE_ADDR.into(), REMOTE_PORT))
             .unwrap();
-        assert_eq!(sent.borrow()[1], PacketMeta::default());
+        #[cfg_attr(not(feature = "packetmeta-next-hop"), allow(unused_mut))]
+        let mut expected = PacketMeta::default();
+        // Only the next hop is the stack's own.
+        #[cfg(feature = "packetmeta-next-hop")]
+        {
+            expected.next_hop = Some(core::net::IpAddr::V4(REMOTE_ADDR));
+        }
+        assert_eq!(sent.borrow()[1], expected);
     }
 
     #[test]
@@ -2091,6 +2098,43 @@ mod test {
         assert_eq!(returned.headroom(), 0);
         assert_eq!(returned.len(), returned.capacity());
         assert!(returned.iter().all(|b| *b == 0x5a));
+    }
+
+    /// Each packet carries its next hop to the driver: its destination if on-link,
+    /// else the router its route names.
+    #[cfg(feature = "packetmeta-next-hop")]
+    #[test]
+    fn test_packet_meta_next_hop() {
+        let driver = TestDevice::new(Medium::Ip);
+        let sent = driver.tx_meta.clone();
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let iface = driver.install(&mut stack, HardwareAddress::Ip);
+        stack
+            .iface(iface)
+            .add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24))
+            .unwrap();
+        let router = Ipv4Addr::new(192, 168, 1, 254);
+        stack
+            .routes_mut()
+            .add(crate::route::Route::new_ipv4_gateway(router, iface))
+            .unwrap();
+        sent.borrow_mut().clear();
+
+        let handle = stack.add_udp_socket().unwrap();
+        let mut socket = stack.udp_socket(handle);
+        socket.bind(LOCAL_PORT, ANY).unwrap();
+        socket.send_slice(b"on", (REMOTE_ADDR, REMOTE_PORT)).unwrap();
+        socket
+            .send_slice(b"off", (Ipv4Addr::new(10, 0, 0, 5), REMOTE_PORT))
+            .unwrap();
+        let hops: Vec<_> = sent.borrow().iter().map(|m| m.next_hop).collect();
+        assert_eq!(
+            hops,
+            [
+                Some(core::net::IpAddr::V4(REMOTE_ADDR)),
+                Some(core::net::IpAddr::V4(router))
+            ]
+        );
     }
 
     #[test]

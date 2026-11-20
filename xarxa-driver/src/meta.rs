@@ -100,6 +100,16 @@ pub struct PacketMeta {
     #[cfg(feature = "packetmeta-timestamp")]
     pub request_timestamp: bool,
 
+    /// The IP address of the neighbor the packet is routed to: its destination if
+    /// on-link, else the router the route names.
+    ///
+    /// Set by the stack on every IP packet it transmits, so that a driver under a
+    /// [`Medium::Ip`](crate::Medium::Ip) interface that resolves link addresses
+    /// itself, such as a 6LoWPAN layer, needn't route again. Meaningful on packets to
+    /// transmit only. Defaults to `None`.
+    #[cfg(feature = "packetmeta-next-hop")]
+    pub next_hop: Option<core::net::IpAddr>,
+
     /// The packet's IPv6 Traffic Class, or IPv4's DS field: its DSCP in the six high
     /// bits, and its ECN field in the two low ones (RFC 2474, RFC 3168), CE included if
     /// the stack marked it.

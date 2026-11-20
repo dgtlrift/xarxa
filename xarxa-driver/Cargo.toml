@@ -51,6 +51,10 @@ local-loss = ["packetmeta-id"]
 ## ECN-capable packets CE while the driver says the link is congested, and tells the
 ## driver of the CE marks it receives. No layer reads another's headers.
 traffic-class = []
+## Enable the `PacketMeta::next_hop` field: the IP address of the neighbor a
+## packet is routed to, for a driver that maps it to a link address itself, as a
+## 6LoWPAN layer under a `Medium::Ip` interface does.
+packetmeta-next-hop = []
 
 [dependencies]
 document-features = "0.2.11"
