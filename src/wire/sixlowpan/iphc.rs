@@ -55,6 +55,7 @@ pub struct Repr {
     pub ll_dst_addr: Option<LlAddress>,
     pub next_header: NextHeader,
     pub hop_limit: u8,
+    /// The ECN field's 2-bit value, when carried inline.
     pub ecn: Option<u8>,
     pub dscp: Option<u8>,
     pub flow_label: Option<u16>,
@@ -206,18 +207,18 @@ impl Repr {
             0b00 => {
                 let b = take(buf, &mut offset, 4)?;
                 (
-                    Some(b[0] & 0b1100_0000),
+                    Some(b[0] >> 6),
                     Some(b[0] & 0b11_1111),
                     Some(u16::from_be_bytes([b[2], b[3]])),
                 )
             }
             0b01 => {
                 let b = take(buf, &mut offset, 3)?;
-                (Some(b[0] & 0b1100_0000), None, Some(u16::from_be_bytes([b[1], b[2]])))
+                (Some(b[0] >> 6), None, Some(u16::from_be_bytes([b[1], b[2]])))
             }
             0b10 => {
                 let b = take(buf, &mut offset, 1)?;
-                (Some(b[0] & 0b1100_0000), Some(b[0] & 0b11_1111), None)
+                (Some(b[0] >> 6), Some(b[0] & 0b11_1111), None)
             }
             _ => (None, None, None),
         };
@@ -447,6 +448,29 @@ mod test {
         // Without the link-layer addresses the elided bits cannot be restored.
         assert!(Repr::parse(&bytes, None, Some(DST_LL), &[]).is_err());
         assert!(Repr::parse(&bytes, Some(SRC_LL), None, &[]).is_err());
+    }
+
+    /// The ECN field parses to its 2-bit value in every TF form that carries it
+    /// (RFC 6282 § 3.1.1: ECN is the first byte's two most significant bits).
+    #[test]
+    fn parse_ecn() {
+        // TF 10: ECN and DSCP; ECT(0) is 0b10 and EF is 46.
+        let bytes = [0x72, 0x33, 0b10_101110, 0x3a];
+        let (repr, _) = Repr::parse(&bytes, Some(SRC_LL), Some(DST_LL), &[]).unwrap();
+        assert_eq!((repr.ecn, repr.dscp, repr.flow_label), (Some(0b10), Some(46), None));
+
+        // TF 01: ECN and the flow label; CE is 0b11.
+        let bytes = [0x6a, 0x33, 0b1100_0000, 0x12, 0x34, 0x3a];
+        let (repr, _) = Repr::parse(&bytes, Some(SRC_LL), Some(DST_LL), &[]).unwrap();
+        assert_eq!((repr.ecn, repr.dscp, repr.flow_label), (Some(0b11), None, Some(0x1234)));
+
+        // TF 00: all three; ECT(1) is 0b01.
+        let bytes = [0x62, 0x33, 0b01_001010, 0x00, 0x12, 0x34, 0x3a];
+        let (repr, _) = Repr::parse(&bytes, Some(SRC_LL), Some(DST_LL), &[]).unwrap();
+        assert_eq!(
+            (repr.ecn, repr.dscp, repr.flow_label),
+            (Some(0b01), Some(10), Some(0x1234))
+        );
     }
 
     /// Context-compressed addresses resolve against the address contexts.
