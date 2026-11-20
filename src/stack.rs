@@ -46,6 +46,8 @@ use crate::storage::{MaybeBox, Slab, Vec};
 use crate::tcp::{ProcessResult, SocketBuffer, TcpHandle, TcpRepr, TcpSocket, TcpSocketIter, TcpSocketState};
 #[cfg(feature = "tcp-listener")]
 use crate::tcp::{TcpListener, TcpListenerHandle, TcpListenerIter, TcpListenerState};
+#[cfg(feature = "ipv6")]
+use crate::time::Duration;
 use crate::time::{Clock, Instant};
 #[cfg(feature = "udp")]
 use crate::udp::{UdpHandle, UdpSocket, UdpSocketIter, UdpSocketState};
@@ -99,6 +101,61 @@ pub(crate) struct StackInner {
     /// The stack's hostname. Empty when unset.
     #[cfg(feature = "hostname")]
     pub(crate) hostname: heapless::String<HOSTNAME_MAX_LEN>,
+    /// Whether IPv6 packets for other nodes are forwarded. Off by default.
+    #[cfg(feature = "ipv6")]
+    ipv6_forwarding: bool,
+    /// The rate limit on the ICMPv6 errors the stack sends.
+    #[cfg(feature = "ipv6")]
+    icmpv6_errors: ErrorLimit,
+    /// The time of the poll in progress.
+    #[cfg(feature = "ipv6")]
+    now: Instant,
+}
+
+/// A token bucket for the ICMPv6 errors the stack sends (RFC 4443 §2.4 (f)): at most
+/// [`ERROR_BURST`](Self::ERROR_BURST) at once, then one each
+/// [`ERROR_INTERVAL`](Self::ERROR_INTERVAL).
+#[cfg(feature = "ipv6")]
+struct ErrorLimit {
+    tokens: u8,
+    /// When the last token was added, or the bucket last found full.
+    refilled_at: Instant,
+}
+
+#[cfg(feature = "ipv6")]
+impl ErrorLimit {
+    const ERROR_BURST: u8 = 10;
+    const ERROR_INTERVAL: Duration = Duration::from_millis(100);
+
+    const fn new() -> Self {
+        Self {
+            tokens: Self::ERROR_BURST,
+            refilled_at: Instant::ZERO,
+        }
+    }
+
+    /// Whether an error may be sent at `now`, taking a token if so.
+    fn take(&mut self, now: Instant) -> bool {
+        if self.tokens == Self::ERROR_BURST {
+            self.refilled_at = now;
+        } else {
+            let interval = Self::ERROR_INTERVAL.as_millis();
+            let added = (now - self.refilled_at).as_millis() / interval;
+            let room = u32::from(Self::ERROR_BURST - self.tokens);
+            if added >= room {
+                self.tokens = Self::ERROR_BURST;
+                self.refilled_at = now;
+            } else {
+                self.tokens += added as u8;
+                self.refilled_at += Duration::from_millis(added * interval);
+            }
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
 }
 
 /// Maximum hostname length, in bytes. The DNS label limit (RFC 1035 §2.3.4).
@@ -580,6 +637,12 @@ impl<'d> Stack<'d> {
                 ipv4_id,
                 #[cfg(feature = "hostname")]
                 hostname: heapless::String::new(),
+                #[cfg(feature = "ipv6")]
+                ipv6_forwarding: false,
+                #[cfg(feature = "ipv6")]
+                icmpv6_errors: ErrorLimit::new(),
+                #[cfg(feature = "ipv6")]
+                now: Instant::ZERO,
             },
             ifaces: Slab::new(),
             sockets: Sockets {
@@ -844,6 +907,34 @@ impl<'d> Stack<'d> {
     /// Access the routing table for modification.
     pub fn routes_mut(&mut self) -> &mut Routes {
         &mut self.inner.routes
+    }
+
+    /// Whether the stack forwards IPv6 packets addressed to other nodes.
+    #[cfg(feature = "ipv6")]
+    pub fn ipv6_forwarding(&self) -> bool {
+        self.inner.ipv6_forwarding
+    }
+
+    /// Set whether the stack forwards IPv6 packets addressed to other nodes, as a
+    /// router does (RFC 8200 §3). Off by default.
+    ///
+    /// A unicast packet for an address no interface has goes on with its hop
+    /// limit one lower, out of the interface and to the next hop that the
+    /// routing decision for its destination names, as the stack's own packets
+    /// do. The rest is unchanged, its Traffic Class included. A packet that
+    /// can't go on is dropped, with an ICMPv6 error back to its source where
+    /// RFC 4443 calls for one:
+    /// - hop limit 1 or 0: Time Exceeded, hop limit exceeded in transit (§3.3);
+    /// - no route: Destination Unreachable, no route to destination (§3.1);
+    /// - larger than the next link's MTU: Packet Too Big (§3.2);
+    /// - a link-local source or destination: none, since such a packet must
+    ///   not leave its link (RFC 4291 §2.5.6).
+    ///
+    /// Multicast isn't forwarded, nor are packets for other nodes received
+    /// while forwarding is off.
+    #[cfg(feature = "ipv6")]
+    pub fn set_ipv6_forwarding(&mut self, forwarding: bool) {
+        self.inner.ipv6_forwarding = forwarding;
     }
 
     /// Add a UDP socket to the stack, returning a handle to it.
@@ -1119,6 +1210,10 @@ impl<'d> Stack<'d> {
     )]
     pub fn poll(&mut self, timestamp: Instant) -> Instant {
         let now = timestamp;
+        #[cfg(feature = "ipv6")]
+        {
+            self.inner.now = now;
+        }
 
         // Everything below that has timers checks them against this clock. The ones
         // that haven't fired count toward when to poll next.
@@ -1780,24 +1875,30 @@ impl<'d> Stack<'d> {
             return;
         }
 
-        {
+        let for_us = {
             let iface = self.ifaces.get(iface.index());
-            if !iface.has_ip_addr(dst_addr.into())
-                && !iface.has_multicast_group(dst_addr.into())
-                && !dst_addr.is_loopback()
+            iface.has_ip_addr(dst_addr.into()) || iface.has_multicast_group(dst_addr.into()) || dst_addr.is_loopback()
+        };
+        if !for_us {
+            if self.inner.ipv6_forwarding
+                && dst_addr.x_is_unicast()
+                && !self.ifaces.iter().any(|(_, i)| i.has_ip_addr(dst_addr.into()))
             {
-                trace!("Rejecting IPv6 packet; not for us");
+                buf.set_len(IPV6_HEADER_LEN + payload_len);
+                self.forward_ipv6(iface, buf);
                 return;
             }
+            trace!("Rejecting IPv6 packet; not for us");
+            return;
+        }
 
-            #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-            if let Some(ll_src) = ll_src
-                && dst_addr.x_is_unicast()
-            {
-                self.inner
-                    .neighbor_cache
-                    .reset_expiry_if_existing((iface.handle, IpAddr::V6(src_addr)), ll_src, now);
-            }
+        #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+        if let Some(ll_src) = ll_src
+            && dst_addr.x_is_unicast()
+        {
+            self.inner
+                .neighbor_cache
+                .reset_expiry_if_existing((iface, IpAddr::V6(src_addr)), ll_src, now);
         }
 
         // Strip any trailing padding added by the link layer.
@@ -1880,6 +1981,61 @@ impl<'d> Stack<'d> {
                 );
             }
         }
+    }
+
+    /// Forward `buf`, an IPv6 packet for another node that arrived on `arrival`, as
+    /// [`set_ipv6_forwarding`](Self::set_ipv6_forwarding) describes.
+    #[cfg(feature = "ipv6")]
+    fn forward_ipv6(&mut self, arrival: IfaceHandle, mut buf: PacketBuf) {
+        let (src_addr, dst_addr, hop_limit) = {
+            let packet = Ipv6Packet::new_unchecked(&mut buf);
+            (packet.src_addr(), packet.dst_addr(), packet.hop_limit())
+        };
+        if src_addr.is_link_local() || dst_addr.is_link_local() {
+            debug!("not forwarding a link-local packet");
+            return;
+        }
+        if hop_limit <= 1 {
+            self.transmit_icmpv6_error(
+                arrival,
+                &mut buf,
+                Icmpv6Message::TimeExceeded,
+                Icmpv6TimeExceeded::HopLimitExceeded.into(),
+                0,
+                false,
+            );
+            return;
+        }
+        let Some(route) = self.tx_context().route(IfaceBinding::Any, &IpAddr::V6(dst_addr)) else {
+            self.transmit_icmpv6_error(
+                arrival,
+                &mut buf,
+                Icmpv6Message::DstUnreachable,
+                Icmpv6DstUnreachable::NoRoute.into(),
+                0,
+                false,
+            );
+            return;
+        };
+        if buf.len() > route.ip_mtu {
+            self.transmit_icmpv6_error(
+                arrival,
+                &mut buf,
+                Icmpv6Message::PktTooBig,
+                0,
+                route.ip_mtu as u32,
+                false,
+            );
+            return;
+        }
+        Ipv6Packet::new_unchecked(&mut buf).set_hop_limit(hop_limit - 1);
+        if !buf.ensure_headroom(route.ip_headroom) {
+            debug!("no room to forward, dropping");
+            return;
+        }
+        let iface = self.ifaces.get_mut(route.iface.index());
+        self.inner
+            .transmit_ip(iface, IpAddr::V6(dst_addr), route.next_hop, buf, EthernetProtocol::Ipv6);
     }
 
     #[cfg(feature = "ipv6")]
@@ -2204,10 +2360,25 @@ impl<'d> Stack<'d> {
         if dst_addr.is_multicast() && !allow_multicast_dst {
             return;
         }
-        let reply_src = if dst_addr.x_is_unicast() {
+        // Never an error about an ICMPv6 error (RFC 4443 §2.4 (e)).
+        if Ipv6Packet::new_unchecked(&mut *orig).next_header() == IpProtocol::Icmpv6
+            && let Some(&msg_type) = orig.get(IPV6_HEADER_LEN)
+            && Icmpv6Message::from(msg_type).is_error()
+        {
+            return;
+        }
+        if !self.inner.icmpv6_errors.take(self.inner.now) {
+            debug!("ICMPv6 error rate limit reached");
+            return;
+        }
+        // The error goes from the address the packet was for, if it is this node's.
+        // A forwarded packet's error goes from an address of the interface it came in
+        // on.
+        let arrival = self.ifaces.get(iface.index());
+        let reply_src = if dst_addr.x_is_unicast() && arrival.has_ip_addr(dst_addr.into()) {
             dst_addr
         } else {
-            self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr)
+            arrival.get_source_address_ipv6(&src_addr)
         };
         let Some((route, checksum_caps)) = self.route_reply(iface, &IpAddr::V6(src_addr)) else {
             return;
@@ -3000,7 +3171,7 @@ fn build_icmpv4_error(
 /// Build an ICMPv6 error message, quoting as much of `orig` (a whole IP packet)
 /// as fits within the minimum MTU (RFC 4443 §2.4). `src_addr` and `dst_addr` are
 /// the addresses the error will be sent between, for the checksum. `pointer` is
-/// written for parameter problem messages. `ip_headroom` is what the IP packet
+/// written for parameter problem messages, and is the MTU of a Packet Too Big. `ip_headroom` is what the IP packet
 /// needs in front of it, as in [`EgressRoute::ip_headroom`].
 #[cfg(feature = "ipv6")]
 #[allow(clippy::too_many_arguments)]
@@ -3029,6 +3200,8 @@ fn build_icmpv6_error(
         icmp.set_msg_code(msg_code);
         if msg_type == Icmpv6Message::ParamProblem {
             icmp.set_param_problem_ptr(pointer);
+        } else if msg_type == Icmpv6Message::PktTooBig {
+            icmp.set_pkt_too_big_mtu(pointer);
         } else {
             icmp.clear_reserved();
         }
@@ -3164,7 +3337,7 @@ pub(crate) mod test {
     #[cfg(feature = "slaac")]
     use crate::test_device::Link;
     use crate::test_device::{Queue, Room, Sent, TestDevice};
-    use crate::time::{Duration, idle_deadline};
+    use crate::time::idle_deadline;
     use crate::udp::RecvError as UdpRecvError;
     #[allow(unused_imports)]
     use std::vec::Vec;
@@ -8042,5 +8215,175 @@ pub(crate) mod test {
             eth_frame_from(OTHER_HW, OUR_HW, EthernetProtocol::Ipv6, &packet[..packet.len() - 1]),
         );
         assert!(!stack.raw_socket(raw).can_recv());
+    }
+
+    const NET_A: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xa, 0, 0, 0, 0, 0, 1);
+    const HOST_A: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xa, 0, 0, 0, 0, 0, 2);
+    const NET_B: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xb, 0, 0, 0, 0, 0, 1);
+    const HOST_B: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xb, 0, 0, 0, 0, 0, 2);
+    /// A host past `HOST_B`, which the router reaches through it.
+    const HOST_C: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xc, 0, 0, 0, 0, 0, 2);
+
+    /// A router between two IP-medium interfaces: the first on `NET_A`/64, the
+    /// second on `NET_B`/64 with an IP MTU of `mtu_b`. Forwarding is on.
+    fn test_router(mtu_b: usize) -> (Stack<'static>, [Queue; 2], [Sent; 2], [IfaceHandle; 2]) {
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let mut rxs = Vec::new();
+        let mut txs = Vec::new();
+        let mut handles = Vec::new();
+        for (addr, mtu) in [(NET_A, 1500), (NET_B, mtu_b)] {
+            let driver = TestDevice::new(Medium::Ip).with_mtu(mtu);
+            let (rx, tx) = (driver.rx.clone(), driver.tx.clone());
+            let handle = driver.install(&mut stack, HardwareAddress::Ip);
+            stack
+                .iface(handle)
+                .set_ip_addrs([IpCidr::new(addr.into(), 64), IpCidr::new(LINK_LOCAL_V6.into(), 64)])
+                .unwrap();
+            rxs.push(rx);
+            txs.push(tx);
+            handles.push(handle);
+        }
+        stack.poll(Instant::ZERO);
+        for tx in &txs {
+            tx.borrow_mut().clear();
+        }
+        stack.set_ipv6_forwarding(true);
+        (
+            stack,
+            rxs.try_into().unwrap(),
+            txs.try_into().unwrap(),
+            handles.try_into().unwrap(),
+        )
+    }
+
+    /// A UDP packet from `src` to `dst` with `hop_limit` and Traffic Class 0xb9 (AF41,
+    /// ECT(1)).
+    fn transit_packet(src: Ipv6Addr, dst: Ipv6Addr, hop_limit: u8) -> Vec<u8> {
+        let udp = udp_datagram(src.into(), 1000, dst.into(), 2000, b"transit");
+        let mut packet = ipv6_packet(src, dst, IpProtocol::Udp, &udp);
+        let mut ip = Ipv6Packet::new_unchecked(&mut packet[..]);
+        ip.set_hop_limit(hop_limit);
+        ip.set_traffic_class(0xb9);
+        packet
+    }
+
+    /// A packet for an address on another interface's link goes out of that
+    /// interface with its hop limit one lower and nothing else changed; with
+    /// forwarding off, it is dropped.
+    #[test]
+    fn test_ipv6_forwarding_on_link() {
+        let (mut stack, rx, tx, _) = test_router(1500);
+        assert!(stack.ipv6_forwarding());
+        let packet = transit_packet(HOST_A, HOST_B, 64);
+        inject(&mut stack, &rx[0], packet.clone());
+        assert!(tx[0].borrow().is_empty());
+        let mut expected = packet.clone();
+        Ipv6Packet::new_unchecked(&mut expected[..]).set_hop_limit(63);
+        assert_eq!(*tx[1].borrow(), [expected]);
+
+        tx[1].borrow_mut().clear();
+        stack.set_ipv6_forwarding(false);
+        inject(&mut stack, &rx[0], packet);
+        assert!(tx[0].borrow().is_empty());
+        assert!(tx[1].borrow().is_empty());
+    }
+
+    /// A packet for a destination behind a router goes out of the route's
+    /// interface.
+    #[test]
+    fn test_ipv6_forwarding_routed() {
+        let (mut stack, rx, tx, ifaces) = test_router(1500);
+        stack
+            .routes_mut()
+            .add(crate::route::Route {
+                cidr: IpCidr::new(HOST_C.into(), 64),
+                via_router: HOST_B.into(),
+                iface: ifaces[1],
+                origin: crate::route::RouteOrigin::Manual,
+                preferred_until: None,
+                expires_at: None,
+            })
+            .unwrap();
+        inject(&mut stack, &rx[0], transit_packet(HOST_A, HOST_C, 2));
+        let tx = tx[1].borrow();
+        assert_eq!(tx.len(), 1);
+        let mut sent = tx[0].clone();
+        let ip = Ipv6Packet::new_checked(&mut sent[..]).unwrap();
+        assert_eq!((ip.dst_addr(), ip.hop_limit(), ip.traffic_class()), (HOST_C, 1, 0xb9));
+    }
+
+    /// At hop limit 1 or 0, the packet goes no further, and a Time Exceeded goes back
+    /// from the router's address on the arrival link, quoting it.
+    #[test]
+    fn test_ipv6_forwarding_hop_limit_exceeded() {
+        for hop_limit in [1, 0] {
+            let (mut stack, rx, tx, _) = test_router(1500);
+            let packet = transit_packet(HOST_A, HOST_B, hop_limit);
+            inject(&mut stack, &rx[0], packet.clone());
+            assert!(tx[1].borrow().is_empty());
+            let tx = tx[0].borrow();
+            assert_eq!(tx.len(), 1);
+            let (msg_type, msg_code, _, quote) = parse_icmpv6_reply(&tx[0], NET_A, HOST_A);
+            assert_eq!(msg_type, Icmpv6Message::TimeExceeded);
+            assert_eq!(msg_code, u8::from(Icmpv6TimeExceeded::HopLimitExceeded));
+            assert_eq!(quote, packet);
+        }
+    }
+
+    /// With no route, a Destination Unreachable goes back; a packet larger than the
+    /// next link's MTU gets a Packet Too Big with that MTU.
+    #[test]
+    fn test_ipv6_forwarding_no_route_and_too_big() {
+        let (mut stack, rx, tx, _) = test_router(IPV6_HEADER_LEN + 8 + 4);
+        inject(&mut stack, &rx[0], transit_packet(HOST_A, HOST_C, 64));
+        let (msg_type, msg_code, _, _) = parse_icmpv6_reply(&tx[0].borrow()[0], NET_A, HOST_A);
+        assert_eq!(msg_type, Icmpv6Message::DstUnreachable);
+        assert_eq!(msg_code, u8::from(Icmpv6DstUnreachable::NoRoute));
+
+        tx[0].borrow_mut().clear();
+        inject(&mut stack, &rx[0], transit_packet(HOST_A, HOST_B, 64));
+        assert!(tx[1].borrow().is_empty());
+        let (msg_type, msg_code, mtu, _) = parse_icmpv6_reply(&tx[0].borrow()[0], NET_A, HOST_A);
+        assert_eq!((msg_type, msg_code), (Icmpv6Message::PktTooBig, 0));
+        assert_eq!(mtu as usize, IPV6_HEADER_LEN + 8 + 4);
+    }
+
+    /// Link-local packets stay on their link, and an ICMPv6 error gets no error
+    /// back.
+    #[test]
+    fn test_ipv6_forwarding_not_forwarded_silently() {
+        let (mut stack, rx, tx, _) = test_router(1500);
+        inject(&mut stack, &rx[0], transit_packet(LINK_LOCAL_REMOTE_V6, HOST_B, 64));
+
+        let mut error = vec![0; 8 + 8];
+        {
+            let mut icmp = Icmpv6Packet::new_unchecked(&mut error[..]);
+            icmp.set_msg_type(Icmpv6Message::DstUnreachable);
+            icmp.set_msg_code(0);
+            icmp.fill_checksum(&HOST_A, &HOST_B);
+        }
+        let mut packet = ipv6_packet(HOST_A, HOST_B, IpProtocol::Icmpv6, &error);
+        Ipv6Packet::new_unchecked(&mut packet[..]).set_hop_limit(1);
+        inject(&mut stack, &rx[0], packet);
+        assert!(tx[0].borrow().is_empty());
+        assert!(tx[1].borrow().is_empty());
+    }
+
+    /// The stack sends at most 10 ICMPv6 errors at once, then one each 100 ms.
+    #[test]
+    fn test_icmpv6_error_rate_limit() {
+        let (mut stack, rx, tx, _) = test_router(1500);
+        let mut send = |at: u32, n: usize| {
+            for _ in 0..n {
+                rx[0].borrow_mut().push_back(transit_packet(HOST_A, HOST_B, 1));
+            }
+            stack.poll(Instant::from_millis(at));
+            core::mem::take(&mut *tx[0].borrow_mut()).len()
+        };
+        assert_eq!(send(1000, 15), 10);
+        assert_eq!(send(1099, 1), 0);
+        assert_eq!(send(1100, 2), 1);
+        assert_eq!(send(1350, 5), 2);
+        assert_eq!(send(5000, 15), 10);
     }
 }
