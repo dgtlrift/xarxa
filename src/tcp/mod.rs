@@ -7380,8 +7380,9 @@ mod test {
         let data = [b'x'; 8192];
         s.view().send_slice(&data[..]).unwrap();
 
-        // Reno's initial congestion window is 2048 bytes: only two
-        // 1024-byte segments may be in flight, the rest must wait for ACKs.
+        // Reno's initial congestion window for a 1024-byte MSS is 4096 bytes
+        // (RFC 5681 § 3.1): only four segments may be in flight, the rest must
+        // wait for ACKs.
         recv!(s, time 0, [TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
@@ -7392,10 +7393,20 @@ mod test {
             ack_number: Some(REMOTE_SEQ + 1),
             payload: &data[..1024],
             ..RECV_TEMPL
+        }, TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 2048,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &data[..1024],
+            ..RECV_TEMPL
+        }, TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 3072,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &data[..1024],
+            ..RECV_TEMPL
         }]);
 
         // ACKing one segment frees congestion window space and grows
-        // cwnd (slow start), allowing further segments out.
+        // cwnd by a segment (slow start), allowing two more out.
         send!(s, time 10, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1 + 1024),
@@ -7403,12 +7414,12 @@ mod test {
             ..SEND_TEMPL
         });
         recv!(s, time 10, [TcpRepr {
-            seq_number: LOCAL_SEQ + 1 + 2048,
+            seq_number: LOCAL_SEQ + 1 + 4096,
             ack_number: Some(REMOTE_SEQ + 1),
             payload: &data[..1024],
             ..RECV_TEMPL
         }, TcpRepr {
-            seq_number: LOCAL_SEQ + 1 + 3072,
+            seq_number: LOCAL_SEQ + 1 + 5120,
             ack_number: Some(REMOTE_SEQ + 1),
             payload: &data[..1024],
             ..RECV_TEMPL
@@ -7433,7 +7444,8 @@ mod test {
         let data = [b'x'; 8192];
         s.view().send_slice(&data[..]).unwrap();
 
-        // Reno's initial congestion window is 2048 bytes, allowing 2 segments
+        // Reno's initial congestion window for a 1024-byte MSS is 4096 bytes,
+        // allowing 4 segments (RFC 5681 § 3.1).
         recv!(s, time 0, [TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
@@ -7441,6 +7453,16 @@ mod test {
             ..RECV_TEMPL
         }, TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 1024,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &data[..1024],
+            ..RECV_TEMPL
+        }, TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 2048,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &data[..1024],
+            ..RECV_TEMPL
+        }, TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 3072,
             ack_number: Some(REMOTE_SEQ + 1),
             payload: &data[..1024],
             ..RECV_TEMPL
@@ -7467,20 +7489,11 @@ mod test {
         });
 
         // A fast retrnasmit should be sent and not be blocked by congestion control.
-        // Fast recovery inflates the congestion window by the three segments the
-        // duplicate ACKs say have left the network, so new data follows it.
+        // Fast recovery sets the congestion window to half the 4096 bytes in
+        // flight, inflated by the three segments the duplicate ACKs say have
+        // left the network: 5120 bytes, so one new segment follows it.
         recv!(s, time 20, [TcpRepr {
             seq_number: LOCAL_SEQ + 1,
-            ack_number: Some(REMOTE_SEQ + 1),
-            payload: &data[..1024],
-            ..RECV_TEMPL
-        }, TcpRepr {
-            seq_number: LOCAL_SEQ + 1 + 2048,
-            ack_number: Some(REMOTE_SEQ + 1),
-            payload: &data[..1024],
-            ..RECV_TEMPL
-        }, TcpRepr {
-            seq_number: LOCAL_SEQ + 1 + 3072,
             ack_number: Some(REMOTE_SEQ + 1),
             payload: &data[..1024],
             ..RECV_TEMPL
@@ -9283,11 +9296,12 @@ mod test {
         s.send_window = 65535;
         s.send_mss = 1024;
 
-        let data = [b'x'; 4096];
+        let data = [b'x'; 8192];
         s.view().send_slice(&data[..]).unwrap();
 
-        // Reno's initial cwnd is 2048: two segments fill the congestion window
-        // exactly, leaving no room for more in flight.
+        // Reno's initial cwnd for a 1024-byte MSS is 4096 (RFC 5681 § 3.1):
+        // four segments fill the congestion window exactly, leaving no room for
+        // more in flight.
         recv!(s, time 0, [TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
@@ -9295,6 +9309,16 @@ mod test {
             ..RECV_TEMPL
         }, TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 1024,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &data[..1024],
+            ..RECV_TEMPL
+        }, TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 2048,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &data[..1024],
+            ..RECV_TEMPL
+        }, TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 3072,
             ack_number: Some(REMOTE_SEQ + 1),
             payload: &data[..1024],
             ..RECV_TEMPL
@@ -9320,7 +9344,7 @@ mod test {
         // sequence space and elicits no reply, so the connection would stall
         // if the remote's window update got lost.
         recv!(s, time 110, Ok(TcpRepr {
-            seq_number: LOCAL_SEQ + 1 + 2048,
+            seq_number: LOCAL_SEQ + 1 + 4096,
             ack_number: Some(REMOTE_SEQ + 1),
             payload: &data[..1],
             ..RECV_TEMPL
