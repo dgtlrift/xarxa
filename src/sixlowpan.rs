@@ -339,7 +339,7 @@ pub(crate) fn sixlowpan_to_ipv6(
     {
         let mut ipv6 = Ipv6Packet::new_unchecked(&mut buf[..IPV6_HEADER_LEN]);
         ipv6.set_version(6);
-        ipv6.set_traffic_class(0);
+        ipv6.set_traffic_class(iphc_repr.dscp.unwrap_or(0) << 2 | iphc_repr.ecn.unwrap_or(0));
         ipv6.set_flow_label(0);
         ipv6.set_payload_len((packet_len - IPV6_HEADER_LEN) as u16);
         ipv6.set_next_header(first_next_header);
@@ -445,6 +445,7 @@ pub(crate) fn ipv6_to_sixlowpan(buf: &mut PacketBuf, ieee_repr: &Ieee802154Repr)
     let src_addr = packet.src_addr();
     let dst_addr = packet.dst_addr();
     let hop_limit = packet.hop_limit();
+    let traffic_class = packet.traffic_class();
     let mut next_header = packet.next_header();
 
     let mut exts = [ExtHeader {
@@ -514,8 +515,10 @@ pub(crate) fn ipv6_to_sixlowpan(buf: &mut PacketBuf, ieee_repr: &Ieee802154Repr)
         ll_dst_addr: ieee_repr.dst_addr,
         next_header: compressed_next(n_ext > 0 || udp.is_some()),
         hop_limit,
-        ecn: None,
-        dscp: None,
+        // The Traffic Class is ECN in its two low bits and DSCP above them
+        // (RFC 8200 § 7); IPHC elides it when it is zero.
+        ecn: Some(traffic_class & 0b11),
+        dscp: Some(traffic_class >> 2),
         flow_label: None,
     };
     let mut ext_reprs = [SixlowpanExtHeaderRepr {
@@ -1655,6 +1658,26 @@ mod test {
             }
         }
         assert!(cases > 500);
+    }
+
+    /// The Traffic Class survives compression: carried inline in IPHC's TF
+    /// field as one byte of ECN and DSCP when it isn't zero, elided when it is.
+    #[test]
+    fn test_traffic_class_roundtrip() {
+        let dst = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x1234);
+        let dst_ll = Ieee802154Address::Short([0x12, 0x34]);
+        let l4 = udp_datagram(OUR_LINK_LOCAL.into(), 1234, dst.into(), 5678, b"payload");
+        let mut plain = None;
+        // 0, ECT(0), CE, AF11 and EF with ECT(0).
+        for tc in [0u8, 0b10, 0b11, 10 << 2, 46 << 2 | 0b10] {
+            let mut packet = ipv6_packet(OUR_LINK_LOCAL, dst, IpProtocol::Udp, &l4);
+            Ipv6Packet::new_unchecked(&mut packet[..]).set_traffic_class(tc);
+            let (compressed, _) = compress(&packet, OUR_LL, dst_ll, 0);
+            let plain = *plain.get_or_insert(compressed.len());
+            assert_eq!(compressed.len(), plain + usize::from(tc != 0), "{tc:#x}");
+            let decompressed = decompress(&compressed, OUR_LL, dst_ll, &[], 0, None).unwrap();
+            assert_eq!(decompressed, packet, "{tc:#x}");
+        }
     }
 
     /// Compression fails cleanly when the packet does not fit the buffer with

@@ -447,6 +447,7 @@ impl TxContext<'_, '_> {
     ///
     /// `src_addr` and `dst_addr` must belong to the same address family, the packet
     /// is dropped otherwise.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn transmit_ip(
         &mut self,
         route: &EgressRoute,
@@ -455,6 +456,7 @@ impl TxContext<'_, '_> {
         dst_addr: IpAddr,
         next_header: IpProtocol,
         hop_limit: u8,
+        traffic_class: u8,
     ) {
         let iface = self.ifaces.get_mut(route.iface.index());
         #[cfg(feature = "ipv4")]
@@ -462,12 +464,20 @@ impl TxContext<'_, '_> {
         let ethertype = match (src_addr, dst_addr) {
             #[cfg(feature = "ipv4")]
             (IpAddr::V4(src), IpAddr::V4(dst)) => {
-                push_ipv4_header(&mut buf, src, dst, next_header, hop_limit, &checksum_caps);
+                push_ipv4_header(
+                    &mut buf,
+                    src,
+                    dst,
+                    next_header,
+                    hop_limit,
+                    traffic_class,
+                    &checksum_caps,
+                );
                 EthernetProtocol::Ipv4
             }
             #[cfg(feature = "ipv6")]
             (IpAddr::V6(src), IpAddr::V6(dst)) => {
-                push_ipv6_header(&mut buf, src, dst, next_header, hop_limit);
+                push_ipv6_header(&mut buf, src, dst, next_header, hop_limit, traffic_class);
                 EthernetProtocol::Ipv6
             }
             #[allow(unreachable_patterns)]
@@ -2087,7 +2097,7 @@ impl<'d> Stack<'d> {
                 ) else {
                     return;
                 };
-                push_ipv4_header(&mut reply, reply_src, src_addr, IpProtocol::Icmp, 64, &checksum_caps);
+                push_ipv4_header(&mut reply, reply_src, src_addr, IpProtocol::Icmp, 64, 0, &checksum_caps);
                 self.process_ipv4(iface, None, reply, now);
             }
             #[cfg(feature = "ipv6")]
@@ -2124,7 +2134,7 @@ impl<'d> Stack<'d> {
                 ) else {
                     return;
                 };
-                push_ipv6_header(&mut reply, reply_src, src_addr, IpProtocol::Icmpv6, 64);
+                push_ipv6_header(&mut reply, reply_src, src_addr, IpProtocol::Icmpv6, 64, 0);
                 self.process_ipv6(iface, None, reply, now);
             }
             Err(_) => {}
@@ -2266,7 +2276,7 @@ impl<'d> Stack<'d> {
         hop_limit: u8,
     ) {
         self.tx_context()
-            .transmit_ip(route, buf, src_addr, dst_addr, next_header, hop_limit);
+            .transmit_ip(route, buf, src_addr, dst_addr, next_header, hop_limit, 0);
     }
 }
 
@@ -2722,7 +2732,7 @@ impl StackInner {
         src_addr: Ipv6Addr,
         dst_addr: Ipv6Addr,
     ) {
-        push_ipv6_header(&mut buf, src_addr, dst_addr, IpProtocol::Icmpv6, 0xff);
+        push_ipv6_header(&mut buf, src_addr, dst_addr, IpProtocol::Icmpv6, 0xff, 0);
         self.transmit_ip(
             iface,
             IpAddr::V6(dst_addr),
@@ -2760,6 +2770,7 @@ impl StackInner {
             dst_addr,
             IpProtocol::Udp,
             64,
+            0,
             &iface.checksum_caps(),
         );
         let dst = IpAddr::V4(dst_addr);
@@ -2898,7 +2909,8 @@ fn packet_log_layer(medium: Medium) -> crate::packet_log::Layer {
     }
 }
 
-/// Prepend an IPv4 header to a fully-built L4 payload.
+/// Prepend an IPv4 header to a fully-built L4 payload, with `traffic_class`'s
+/// DSCP and ECN (RFC 2474 § 3, RFC 3168 § 5).
 ///
 /// The header checksum is only computed if the egress device doesn't do it
 /// itself; it is written as zero otherwise, since devices might rely on it.
@@ -2910,6 +2922,7 @@ pub(crate) fn push_ipv4_header(
     dst_addr: Ipv4Addr,
     next_header: IpProtocol,
     hop_limit: u8,
+    traffic_class: u8,
     checksum_caps: &ChecksumCapabilities,
 ) {
     let payload_len = buf.len();
@@ -2917,8 +2930,8 @@ pub(crate) fn push_ipv4_header(
     let mut packet = Ipv4Packet::new_unchecked(buf);
     packet.set_version(4);
     packet.set_header_len(IPV4_HEADER_LEN as u8);
-    packet.set_dscp(0);
-    packet.set_ecn(0);
+    packet.set_dscp(traffic_class >> 2);
+    packet.set_ecn(traffic_class & 0b11);
     packet.set_total_len((IPV4_HEADER_LEN + payload_len) as u16);
     packet.set_ident(0);
     packet.clear_flags();
@@ -2936,7 +2949,8 @@ pub(crate) fn push_ipv4_header(
     }
 }
 
-/// Prepend an IPv6 header to a fully-built L4 payload.
+/// Prepend an IPv6 header to a fully-built L4 payload, with `traffic_class`:
+/// DSCP in its six high bits and ECN in its two low ones (RFC 8200 § 7).
 #[cfg(feature = "ipv6")]
 pub(crate) fn push_ipv6_header(
     buf: &mut PacketBuf,
@@ -2944,12 +2958,13 @@ pub(crate) fn push_ipv6_header(
     dst_addr: Ipv6Addr,
     next_header: IpProtocol,
     hop_limit: u8,
+    traffic_class: u8,
 ) {
     let payload_len = buf.len();
     buf.push_front(IPV6_HEADER_LEN);
     let mut packet = Ipv6Packet::new_unchecked(buf);
     packet.set_version(6);
-    packet.set_traffic_class(0);
+    packet.set_traffic_class(traffic_class);
     packet.set_flow_label(0);
     packet.set_payload_len(payload_len as u16);
     packet.set_next_header(next_header);
@@ -6276,7 +6291,7 @@ pub(crate) mod test {
 
                 let mut cx = stack.tx_context();
                 let route = cx.route(IfaceBinding::Any, &REMOTE_V4.into()).unwrap();
-                cx.transmit_ip(&route, buf, OUR_V4.into(), REMOTE_V4.into(), IpProtocol::Udp, 64);
+                cx.transmit_ip(&route, buf, OUR_V4.into(), REMOTE_V4.into(), IpProtocol::Udp, 64, 0);
 
                 let frames = tx.borrow();
                 assert!(!frames.is_empty(), "ip_packet_len: {}", ip_packet_len);

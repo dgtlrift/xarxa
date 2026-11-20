@@ -862,6 +862,7 @@ impl IfaceState<'_> {
                 dst_addr,
                 IpProtocol::Udp,
                 64,
+                0,
                 &checksum_caps,
             );
             inner.transmit_ethernet(self, dst_hw, buf, EthernetProtocol::Ipv4);
