@@ -587,17 +587,36 @@ pub(crate) fn ipv6_to_sixlowpan(buf: &mut PacketBuf, ieee_repr: &Ieee802154Repr)
 }
 
 // Egress.
+/// The 802.15.4 address whose interface identifier (RFC 6282 § 3.2.2) is `iid`:
+/// the short address that `0000:00ff:fe00:XXXX` embeds, or else the extended
+/// address with the U/L bit inverted back. IPHC only compares identifiers, so
+/// this carries any link's identifier through the 802.15.4-shaped code exactly.
+fn link_addr_of_iid(iid: [u8; 8]) -> Ieee802154Address {
+    match iid {
+        [0, 0, 0, 0xff, 0xfe, 0, h, l] => Ieee802154Address::Short([h, l]),
+        mut eui => {
+            eui[0] ^= 1 << 1;
+            Ieee802154Address::Extended(eui)
+        }
+    }
+}
+
 /// Compress the IPv6 packet in `buf` in place to a 6LoWPAN packet (RFC 6282), as
-/// sent from link address `ll_src` to `ll_dst`: the IPv6 header and the extension
-/// and UDP headers that follow become IPHC and NHC, eliding what the link addresses
-/// imply.
+/// sent between the link addresses whose interface identifiers are `src_iid` and
+/// `dst_iid`: the IPv6 header and the extension and UDP headers that follow
+/// become IPHC and NHC, eliding what the identifiers imply.
+///
+/// The identifiers are the link's own (RFC 6282 § 3.2.2): from an 802.15.4
+/// address, or a 48-bit one by Modified EUI-64 (RFC 2464 § 4, RFC 7668
+/// § 3.2.2), so any link can carry 6LoWPAN.
 ///
 /// Returns how much shorter the header chain became, which RFC 4944
 /// fragmentation needs for its offsets.
 ///
 /// # Errors
 /// - `Malformed`: if `buf` isn't a valid IPv6 packet.
-pub fn compress(buf: &mut PacketBuf, ll_src: Ieee802154Address, ll_dst: Ieee802154Address) -> Result<usize, Malformed> {
+pub fn compress(buf: &mut PacketBuf, src_iid: [u8; 8], dst_iid: [u8; 8]) -> Result<usize, Malformed> {
+    let (ll_src, ll_dst) = (link_addr_of_iid(src_iid), link_addr_of_iid(dst_iid));
     let repr = Ieee802154Repr {
         frame_type: Ieee802154FrameType::Data,
         security_enabled: false,
@@ -615,8 +634,9 @@ pub fn compress(buf: &mut PacketBuf, ll_src: Ieee802154Address, ll_dst: Ieee8021
 }
 
 /// Decompress the 6LoWPAN packet in `buf`, IPHC first, in place to an IPv6
-/// packet (RFC 6282), as received from link address `ll_src` at `ll_dst`, with
-/// the stateful-compression contexts `contexts`.
+/// packet (RFC 6282), as received between the link addresses whose interface
+/// identifiers are `src_iid` and `dst_iid` (see [`compress`]), with the
+/// stateful-compression contexts `contexts`.
 ///
 /// `total_len` is the whole IPv6 packet's length when `buf` is the first
 /// fragment of one (RFC 4944 § 5.3), and `None` for a whole packet. The headroom
@@ -627,11 +647,12 @@ pub fn compress(buf: &mut PacketBuf, ll_src: Ieee802154Address, ll_dst: Ieee8021
 ///   wasn't given.
 pub fn decompress(
     buf: &mut PacketBuf,
-    ll_src: Option<Ieee802154Address>,
-    ll_dst: Option<Ieee802154Address>,
+    src_iid: Option<[u8; 8]>,
+    dst_iid: Option<[u8; 8]>,
     contexts: &[SixlowpanAddressContext],
     total_len: Option<usize>,
 ) -> Result<(), Malformed> {
+    let (ll_src, ll_dst) = (src_iid.map(link_addr_of_iid), dst_iid.map(link_addr_of_iid));
     sixlowpan_to_ipv6(buf, ll_src, ll_dst, contexts, total_len)
 }
 
@@ -1081,7 +1102,7 @@ mod test {
         buf.set_len(packet.len());
         buf.copy_from_slice(packet);
         // Through the public API, which the stack's own medium shares.
-        let header_diff = super::compress(&mut buf, src, dst).unwrap();
+        let header_diff = super::compress(&mut buf, iid(src), iid(dst)).unwrap();
         (buf.to_vec(), header_diff)
     }
 
@@ -1099,8 +1120,58 @@ mod test {
         buf.reserve(headroom);
         buf.set_len(payload.len());
         buf.copy_from_slice(payload);
-        super::decompress(&mut buf, Some(src), Some(dst), context, total_len)?;
+        super::decompress(&mut buf, Some(iid(src)), Some(iid(dst)), context, total_len)?;
         Ok(buf.to_vec())
+    }
+
+    /// The interface identifier of 802.15.4 address `a` (RFC 6282 § 3.2.2).
+    fn iid(a: Ieee802154Address) -> [u8; 8] {
+        match a {
+            Ieee802154Address::Short([h, l]) => [0, 0, 0, 0xff, 0xfe, 0, h, l],
+            a => a.as_eui_64().unwrap(),
+        }
+    }
+
+    #[test]
+    fn identifiers_map_back_to_the_addresses_they_come_from() {
+        for a in [
+            Ieee802154Address::Short([0x12, 0x34]),
+            Ieee802154Address::Extended([0x02, 0, 0, 0, 0, 0, 1, 1]),
+            Ieee802154Address::Extended([0x50, 0x14, 0x87, 0xff, 0xfe, 0x11, 0x22, 0x33]),
+        ] {
+            assert_eq!(super::link_addr_of_iid(iid(a)), a);
+        }
+    }
+
+    /// A packet between two Ethernet hosts, whose interface identifiers come from
+    /// 48-bit addresses by Modified EUI-64, compresses fully and decompresses back.
+    #[test]
+    fn link_local_addresses_from_48_bit_addresses_are_elided() {
+        // 00:1b:63:84:45:e6 and 02:00:5e:10:00:01, with FFFE inserted and the U/L bit
+        // inverted (RFC 2464 § 4).
+        let a = [0x02, 0x1b, 0x63, 0xff, 0xfe, 0x84, 0x45, 0xe6];
+        let b = [0x00, 0x00, 0x5e, 0xff, 0xfe, 0x10, 0x00, 0x01];
+        let link_local = |iid: [u8; 8]| {
+            let mut o = [0u8; 16];
+            o[..2].copy_from_slice(&[0xfe, 0x80]);
+            o[8..].copy_from_slice(&iid);
+            Ipv6Addr::from(o)
+        };
+        let (src, dst) = (link_local(a), link_local(b));
+        let udp = udp_datagram(src.into(), 1234, dst.into(), 5678, b"hello");
+        let packet = ipv6_packet(src, dst, IpProtocol::Udp, &udp);
+        let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
+        buf.reserve(0);
+        buf.set_len(packet.len());
+        buf.copy_from_slice(&packet);
+        super::compress(&mut buf, a, b).unwrap();
+        // IPHC with both addresses elided (SAM = DAM = 11) and the UDP header compressed.
+        assert_eq!(buf[1] & 0b0011_0011, 0b0011_0011);
+        // At most IPHC's 2 octets and a hop limit, and NHC's UDP header with both ports
+        // inline: 1 + 4 + 2.
+        assert!(buf.len() <= packet.len() - 48 + 10);
+        super::decompress(&mut buf, Some(a), Some(b), &[], None).unwrap();
+        assert_eq!(&buf[..], &packet[..]);
     }
 
     /// The IPv6 packet an unfragmented transmitted frame carries.
