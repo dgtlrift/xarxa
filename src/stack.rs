@@ -1215,6 +1215,15 @@ impl<'d> Stack<'d> {
         Ok(handle)
     }
 
+    /// Fire an extension's timer at the next poll: for state the application changed
+    /// between polls that the extension acts on, such as a route discovery it asked for.
+    /// Returns `false` if no extension is registered in `handle`'s slot.
+    #[cfg(feature = "extension")]
+    pub fn wake_extension(&mut self, handle: ExtHandle) -> bool {
+        let now = self.inner.now;
+        self.extensions.wake(handle, now)
+    }
+
     /// Remove an extension, handing it back. Its timer is disarmed. `None` if the slot is
     /// already free.
     #[cfg(feature = "extension")]

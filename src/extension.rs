@@ -17,7 +17,9 @@
 //! - **Its timer** ([`on_timer`](Extension::on_timer)), armed with
 //!   [`ExtCx::set_timer`]. [`Stack::poll`](crate::Stack::poll) fires it once its instant
 //!   has come, and counts it in the deadline it returns, so an application that waits on
-//!   that deadline wakes for the timer and never polls on a cadence.
+//!   that deadline wakes for the timer and never polls on a cadence. The application
+//!   fires it at the next poll with [`Stack::wake_extension`](crate::Stack::wake_extension),
+//!   after changing state the extension acts on.
 //!
 //! Each hook runs with its extension taken out of its slot, and gets an [`ExtCx`]: the
 //! time, its timer, the route table, the interfaces, and a way to send. A hook can't
@@ -585,6 +587,19 @@ impl<'d> Extensions<'d> {
             }
         }
         due
+    }
+
+    /// Arms the timer of the extension in `handle`'s slot for `now`, unless it's armed
+    /// sooner; `false` if the slot is free.
+    pub(crate) fn wake(&mut self, handle: ExtHandle, now: Instant) -> bool {
+        let Some(slot) = self.slots.get_mut(handle.index()).filter(|slot| slot.used) else {
+            return false;
+        };
+        slot.timer = Some(match slot.timer {
+            Some(at) if at <= now => at,
+            _ => now,
+        });
+        true
     }
 
     /// The armed timers.

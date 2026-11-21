@@ -252,6 +252,23 @@ fn a_timer_set_for_now_asks_for_a_poll_at_once() {
 }
 
 #[test]
+fn a_woken_extension_fires_at_the_next_poll() {
+    let (mut mock, calls) = Mock::new();
+    mock.attach_timer = Some(Instant::from_millis(500));
+    let (mut stack, _, _) = stack_with(mock);
+    assert_eq!(stack.poll(Instant::from_millis(10)), Instant::from_millis(500));
+    // Woken, it fires at the next poll, though its timer was later; then the deadline is
+    // the stack's own.
+    assert!(stack.wake_extension(ExtHandle(0)));
+    stack.poll(Instant::from_millis(20));
+    assert_eq!(calls.borrow()[1], Call::Timer(Instant::from_millis(20)));
+    assert_eq!(calls.borrow().len(), 2);
+    // A free slot isn't woken.
+    assert!(stack.remove_extension(ExtHandle(0)).is_some());
+    assert!(!stack.wake_extension(ExtHandle(0)));
+}
+
+#[test]
 fn an_icmpv6_type_it_names_is_handed_over_and_answered() {
     let (mut mock, calls) = Mock::new();
     mock.echo = true;
