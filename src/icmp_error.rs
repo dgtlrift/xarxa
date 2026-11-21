@@ -7,17 +7,17 @@
 use crate::error::IcmpError;
 #[cfg(feature = "tcp")]
 use crate::wire::TcpSeqNumber;
-#[cfg(all(feature = "ipv4", any(feature = "udp", feature = "tcp")))]
+#[cfg(all(feature = "ipv4", any(feature = "udp", feature = "tcp", feature = "extension")))]
 use crate::wire::{IPV4_HEADER_LEN, Icmpv4DstUnreachable, Icmpv4Message, Ipv4Packet};
-#[cfg(all(feature = "ipv6", any(feature = "udp", feature = "tcp")))]
+#[cfg(all(feature = "ipv6", any(feature = "udp", feature = "tcp", feature = "extension")))]
 use crate::wire::{IPV6_HEADER_LEN, Icmpv6DstUnreachable, Icmpv6Message, Ipv6ExtHeader, Ipv6Packet};
-#[cfg(any(feature = "udp", feature = "tcp"))]
+#[cfg(any(feature = "udp", feature = "tcp", feature = "extension"))]
 use crate::wire::{IpAddr, IpProtocol, IpVersion};
 
 impl IcmpError {
     /// Condense an ICMPv4 error message's type and code, `None` if the message is
     /// not an error to be delivered to sockets (informational messages, redirects).
-    #[cfg(all(feature = "ipv4", any(feature = "udp", feature = "tcp")))]
+    #[cfg(all(feature = "ipv4", any(feature = "udp", feature = "tcp", feature = "extension")))]
     pub(crate) fn from_icmpv4(msg_type: Icmpv4Message, msg_code: u8) -> Option<IcmpError> {
         match msg_type {
             Icmpv4Message::DstUnreachable => Some(match Icmpv4DstUnreachable(msg_code) {
@@ -44,7 +44,7 @@ impl IcmpError {
 
     /// Condense an ICMPv6 error message's type and code, `None` if the message is
     /// not an error to be delivered to sockets.
-    #[cfg(all(feature = "ipv6", any(feature = "udp", feature = "tcp")))]
+    #[cfg(all(feature = "ipv6", any(feature = "udp", feature = "tcp", feature = "extension")))]
     pub(crate) fn from_icmpv6(msg_type: Icmpv6Message, msg_code: u8) -> Option<IcmpError> {
         match msg_type {
             Icmpv6Message::DstUnreachable => Some(match Icmpv6DstUnreachable(msg_code) {
@@ -64,7 +64,9 @@ impl IcmpError {
 ///
 /// The quoted packet is one *we sent*: its source is the local end of the flow,
 /// its destination the remote end.
-#[cfg(any(feature = "udp", feature = "tcp"))]
+#[cfg(any(feature = "udp", feature = "tcp", feature = "extension"))]
+// An extension reads only the protocol; the sockets read the rest.
+#[cfg_attr(not(any(feature = "udp", feature = "tcp")), allow(dead_code))]
 pub(crate) struct QuotedPacket {
     pub src_addr: IpAddr,
     pub dst_addr: IpAddr,
@@ -84,7 +86,7 @@ pub(crate) struct QuotedPacket {
 /// payload, which is enough for the ports (and, for TCP, the sequence number) that
 /// identify the flow. Returns `None` if the quote is too truncated or malformed to
 /// identify one.
-#[cfg(any(feature = "udp", feature = "tcp"))]
+#[cfg(any(feature = "udp", feature = "tcp", feature = "extension"))]
 pub(crate) fn parse_quoted_packet(quote: &mut [u8]) -> Option<QuotedPacket> {
     let (src_addr, dst_addr, protocol, l4_offset): (IpAddr, IpAddr, _, _) = match IpVersion::of_packet(quote).ok()? {
         #[cfg(feature = "ipv4")]
@@ -137,7 +139,12 @@ pub(crate) fn parse_quoted_packet(quote: &mut [u8]) -> Option<QuotedPacket> {
     })
 }
 
-#[cfg(all(test, feature = "ipv4", feature = "ipv6", any(feature = "udp", feature = "tcp")))]
+#[cfg(all(
+    test,
+    feature = "ipv4",
+    feature = "ipv6",
+    any(feature = "udp", feature = "tcp", feature = "extension")
+))]
 mod test {
     use super::*;
     use crate::wire::{Ipv4Addr, Ipv6Addr};

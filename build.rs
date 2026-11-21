@@ -19,6 +19,7 @@ static CONFIGS: &[(&str, usize)] = &[
     ("RAW_SOCKET_COUNT", 2),
     ("TCP_SOCKET_COUNT", 4),
     ("TCP_LISTENER_COUNT", 2),
+    ("EXTENSION_COUNT", 1),
     ("UDP_RX_QUEUE_COUNT", 4),
     ("RAW_RX_QUEUE_COUNT", 4),
     ("TCP_LISTENER_BACKLOG", 4),

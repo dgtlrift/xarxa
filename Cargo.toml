@@ -141,6 +141,11 @@ iface-bind = []
 ## the sockets that provoked them.
 icmp-errors = []
 
+## Extensions: protocols added to the stack without changing its core, such as a
+## routing protocol or a transport (`Stack::add_extension`). Needs `ipv6`. Their
+## number is set by the `extension-count-N` features.
+extension = ["ipv6"]
+
 #! ### TCP congestion control
 #! Enable one of these features to enable congestion control. No feature enabled means
 #! no congestion control. You may enable at most one.
@@ -348,6 +353,15 @@ tcp-listener-count-8 = []
 tcp-listener-count-16 = []
 tcp-listener-count-32 = []
 tcp-listener-count-64 = []
+
+extension-count-1 = [] # Default
+extension-count-2 = []
+extension-count-3 = []
+extension-count-4 = []
+extension-count-5 = []
+extension-count-6 = []
+extension-count-7 = []
+extension-count-8 = []
 
 udp-rx-queue-count-1 = []
 udp-rx-queue-count-2 = []

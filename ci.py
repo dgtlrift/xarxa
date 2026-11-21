@@ -92,6 +92,8 @@ EXTRAS = [
     "multicast",
     "multicast,defmt",
     "multicast,icmp-errors,icmp-ping-reply",
+    "extension",
+    "extension,icmp-errors,defmt",
     "std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,tcp-timestamps,tcp-sack,"
     "packet-log,dhcpv4,dhcpv4-options,dhcpv4-server,multicast,ipv4-fragmentation,ipv4-reassembly,"
     "medium-ieee802154,sixlowpan-fragmentation,sixlowpan-reassembly,slaac",
@@ -213,6 +215,11 @@ def collect():
     # and the tests that exercise a congestion window are gated on `tcp-reno`.)
     cmds.test(join("alloc", FULL, "tcp-reno"), lib=False)
     cmds.raw(["build", "--examples"])
+    # Extensions: their tests, and the smallest stacks that carry one, with no
+    # transport of the stack's own.
+    cmds.test(join("alloc", FULL, "extension"))
+    for extra in ["", "icmp-errors", "alloc,icmp-errors"]:
+        cmds.check(join("medium-ip,ipv6,extension", extra))
 
     return cmds.all()
 
