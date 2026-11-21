@@ -60,6 +60,7 @@ default = [
     "local-loss",
     "traffic-class",
     "packetmeta-next-hop",
+    "neighbor-unreachable",
 ]
 
 ## Use the heap. Used for:
@@ -179,6 +180,12 @@ traffic-class = ["xarxa-driver/traffic-class"]
 ## Put each packet's next hop in its `PacketMeta`, for a driver that resolves link
 ## addresses itself.
 packetmeta-next-hop = ["xarxa-driver/packetmeta-next-hop"]
+## Hand the drivers' reports of neighbors that acknowledged none of a frame's
+## transmissions (`Driver::poll_unreachable`) to the extensions
+## (`Extension::on_neighbor_unreachable`), for a routing protocol to repair its routes.
+## A driver names the neighbor by the packet's next hop, so this implies
+## `packetmeta-next-hop`.
+neighbor-unreachable = ["packetmeta-next-hop", "xarxa-driver/neighbor-unreachable"]
 
 #! ### Logging
 ## Log with the `log` crate.

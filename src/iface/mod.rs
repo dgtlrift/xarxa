@@ -833,6 +833,11 @@ impl IfaceState<'_> {
         self.driver.poll_local_loss()
     }
 
+    #[cfg(all(feature = "neighbor-unreachable", feature = "extension"))]
+    pub(crate) fn poll_unreachable(&mut self) -> Option<core::net::IpAddr> {
+        self.driver.poll_unreachable()
+    }
+
     #[cfg(feature = "packetmeta-timestamp")]
     pub(crate) fn drain_tx_timestamps(&mut self, timestamps: &mut TxTimestampQueue) {
         while let Some(timestamp) = self.driver.poll_tx_timestamp() {

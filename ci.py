@@ -217,8 +217,8 @@ def collect():
     cmds.raw(["build", "--examples"])
     # Extensions: their tests, and the smallest stacks that carry one, with no
     # transport of the stack's own.
-    cmds.test(join("alloc", FULL, "extension"))
-    for extra in ["", "icmp-errors", "alloc,icmp-errors"]:
+    cmds.test(join("alloc", FULL, "extension,neighbor-unreachable"))
+    for extra in ["", "icmp-errors", "alloc,icmp-errors", "icmp-errors,neighbor-unreachable"]:
         cmds.check(join("medium-ip,ipv6,extension", extra))
 
     return cmds.all()
