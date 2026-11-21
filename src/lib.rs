@@ -42,6 +42,8 @@ pub mod dns;
 #[cfg(feature = "std")]
 pub mod driver_impls;
 pub mod error;
+#[cfg(feature = "extension")]
+pub mod extension;
 #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
 mod fragmentation;
 #[cfg(feature = "icmp-errors")]

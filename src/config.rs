@@ -115,6 +115,11 @@ pub const TCP_SOCKET_COUNT: usize = raw::TCP_SOCKET_COUNT;
 /// Ignored with `alloc`. Default: 2.
 pub const TCP_LISTENER_COUNT: usize = raw::TCP_LISTENER_COUNT;
 
+/// Max extensions a [`Stack`](crate::Stack) can hold (feature `extension`).
+///
+/// Default: 1.
+pub const EXTENSION_COUNT: usize = raw::EXTENSION_COUNT;
+
 /// Max datagrams a UDP socket queues for receiving.
 ///
 /// Datagrams arriving on a full queue are dropped.

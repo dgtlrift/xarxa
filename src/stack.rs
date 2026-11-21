@@ -17,13 +17,21 @@ use crate::driver::TxTimestamp;
 use crate::driver::{ChecksumCapabilities, Driver, PacketBuf};
 #[cfg(any(feature = "udp", feature = "_raw", feature = "tcp"))]
 use crate::error::Full;
-#[cfg(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp")))]
+#[cfg(all(
+    feature = "icmp-errors",
+    any(feature = "udp", feature = "tcp", feature = "extension")
+))]
 use crate::error::IcmpError;
 #[cfg(feature = "ipv6")]
 use crate::error::Malformed;
+#[cfg(feature = "extension")]
+use crate::extension::{ExtHandle, Extension, Extensions, IpInfo, Path, RouteVerdict, Verdict};
 #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
 use crate::fragmentation::Fragmenter;
-#[cfg(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp")))]
+#[cfg(all(
+    feature = "icmp-errors",
+    any(feature = "udp", feature = "tcp", feature = "extension")
+))]
 use crate::icmp_error::parse_quoted_packet;
 #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
 use crate::iface::link_local_addr;
@@ -61,6 +69,8 @@ pub struct Stack<'d> {
     pub(crate) sockets: Sockets<'d>,
     #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
     pub(crate) fragments: FragmentsBuffer,
+    #[cfg(feature = "extension")]
+    pub(crate) extensions: Extensions<'d>,
 }
 
 /// The stack's socket storage, one slab per socket type.
@@ -112,7 +122,7 @@ pub(crate) struct StackInner {
     icmpv6_errors: ErrorLimit,
     /// The time of the poll in progress.
     #[cfg(feature = "ipv6")]
-    now: Instant,
+    pub(crate) now: Instant,
 }
 
 /// A token bucket for the ICMPv6 errors the stack sends (RFC 4443 §2.4 (f)): at most
@@ -225,7 +235,8 @@ impl StackInner {
     feature = "medium-ethernet",
     feature = "medium-ieee802154",
     feature = "ipv4-fragmentation",
-    feature = "sixlowpan-fragmentation"
+    feature = "sixlowpan-fragmentation",
+    feature = "extension"
 ))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Blocked {
@@ -248,6 +259,8 @@ pub(crate) const POOL_RETRY_DELAY: crate::time::Duration = crate::time::Duration
 pub(crate) struct TxContext<'a, 'd> {
     pub(crate) inner: &'a mut StackInner,
     pub(crate) ifaces: &'a mut Slab<IfaceState<'d>, IFACE_COUNT>,
+    #[cfg(feature = "extension")]
+    pub(crate) extensions: &'a mut Extensions<'d>,
 }
 
 /// The interface a socket is bound to, if any.
@@ -377,7 +390,7 @@ impl TxContext<'_, '_> {
     ///
     /// # Panics
     /// Panics if the handle is stale (the interface was removed).
-    #[cfg(any(feature = "udp", feature = "tcp", feature = "_raw"))]
+    #[cfg(any(feature = "udp", feature = "tcp", feature = "_raw", feature = "extension"))]
     pub(crate) fn can_transmit(&mut self, iface: IfaceHandle) -> Result<(), Blocked> {
         self.ifaces.get_mut(iface.index()).can_transmit_new_packet()
     }
@@ -518,9 +531,8 @@ impl TxContext<'_, '_> {
         hop_limit: u8,
         traffic_class: u8,
     ) {
-        let iface = self.ifaces.get_mut(route.iface.index());
         #[cfg(feature = "ipv4")]
-        let checksum_caps = iface.checksum_caps();
+        let checksum_caps = self.ifaces.get(route.iface.index()).checksum_caps();
         let ethertype = match (src_addr, dst_addr) {
             #[cfg(feature = "ipv4")]
             (IpAddr::V4(src), IpAddr::V4(dst)) => {
@@ -538,6 +550,10 @@ impl TxContext<'_, '_> {
             #[cfg(feature = "ipv6")]
             (IpAddr::V6(src), IpAddr::V6(dst)) => {
                 push_ipv6_header(&mut buf, src, dst, next_header, hop_limit, traffic_class);
+                #[cfg(feature = "extension")]
+                if self.egress(Path::Originated, &mut buf, route.ip_headroom) != Verdict::Continue {
+                    return;
+                }
                 EthernetProtocol::Ipv6
             }
             #[allow(unreachable_patterns)]
@@ -546,6 +562,7 @@ impl TxContext<'_, '_> {
                 return;
             }
         };
+        let iface = self.ifaces.get_mut(route.iface.index());
         self.inner.transmit_ip(iface, dst_addr, route.next_hop, buf, ethertype);
     }
 
@@ -561,14 +578,25 @@ impl TxContext<'_, '_> {
 
     /// Transmit a fully-built IP packet (IP header included, emitted as-is).
     #[cfg(feature = "raw-ip")]
-    pub(crate) fn transmit_raw_ip(&mut self, route: &EgressRoute, buf: PacketBuf, dst_addr: IpAddr) {
-        let iface = self.ifaces.get_mut(route.iface.index());
+    pub(crate) fn transmit_raw_ip(
+        &mut self,
+        route: &EgressRoute,
+        #[cfg_attr(not(feature = "extension"), allow(unused_mut))] mut buf: PacketBuf,
+        dst_addr: IpAddr,
+    ) {
         let ethertype = match dst_addr {
             #[cfg(feature = "ipv4")]
             IpAddr::V4(_) => EthernetProtocol::Ipv4,
             #[cfg(feature = "ipv6")]
-            IpAddr::V6(_) => EthernetProtocol::Ipv6,
+            IpAddr::V6(_) => {
+                #[cfg(feature = "extension")]
+                if self.egress(Path::Originated, &mut buf, route.ip_headroom) != Verdict::Continue {
+                    return;
+                }
+                EthernetProtocol::Ipv6
+            }
         };
+        let iface = self.ifaces.get_mut(route.iface.index());
         self.inner.transmit_ip(iface, dst_addr, route.next_hop, buf, ethertype);
     }
 }
@@ -674,6 +702,8 @@ impl<'d> Stack<'d> {
             },
             #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
             fragments: FragmentsBuffer::new(),
+            #[cfg(feature = "extension")]
+            extensions: Extensions::new(),
         }
     }
 
@@ -985,6 +1015,8 @@ impl<'d> Stack<'d> {
             tx: TxContext {
                 inner: &mut self.inner,
                 ifaces: &mut self.ifaces,
+                #[cfg(feature = "extension")]
+                extensions: &mut self.extensions,
             },
         }
     }
@@ -1020,6 +1052,8 @@ impl<'d> Stack<'d> {
             tx: TxContext {
                 inner: &mut self.inner,
                 ifaces: &mut self.ifaces,
+                #[cfg(feature = "extension")]
+                extensions: &mut self.extensions,
             },
         }
     }
@@ -1114,6 +1148,8 @@ impl<'d> Stack<'d> {
             tx: TxContext {
                 inner: &mut self.inner,
                 ifaces: &mut self.ifaces,
+                #[cfg(feature = "extension")]
+                extensions: &mut self.extensions,
             },
         }
     }
@@ -1158,7 +1194,32 @@ impl<'d> Stack<'d> {
         TxContext {
             inner: &mut self.inner,
             ifaces: &mut self.ifaces,
+            #[cfg(feature = "extension")]
+            extensions: &mut self.extensions,
         }
+    }
+
+    /// Register an extension, in one of a fixed number of slots set at build time
+    /// ([`EXTENSION_COUNT`](crate::config::EXTENSION_COUNT)), and call its
+    /// [`on_attach`](Extension::on_attach).
+    ///
+    /// The stack holds it until it's removed; state the application reads goes in a
+    /// `RefCell` the two share (see [`extension`](crate::extension)).
+    ///
+    /// # Errors
+    /// - `Full`: if every slot is taken.
+    #[cfg(feature = "extension")]
+    pub fn add_extension(&mut self, ext: &'d mut dyn Extension) -> Result<ExtHandle, crate::error::Full> {
+        let handle = self.extensions.add(ext).ok_or(crate::error::Full)?;
+        self.tx_context().attach(handle);
+        Ok(handle)
+    }
+
+    /// Remove an extension, handing it back. Its timer is disarmed. `None` if the slot is
+    /// already free.
+    #[cfg(feature = "extension")]
+    pub fn remove_extension(&mut self, handle: ExtHandle) -> Option<&'d mut dyn Extension> {
+        self.extensions.remove(handle)
     }
 
     /// Iterate over the interfaces added to the stack.
@@ -1248,19 +1309,37 @@ impl<'d> Stack<'d> {
         }
 
         // Hand each TCP segment a driver reports lost to its socket, which sends it
-        // again in the egress below.
-        #[cfg(all(feature = "local-loss", feature = "tcp"))]
-        for (_, iface) in self.ifaces.iter_mut() {
-            while let Some(loss) = iface.poll_local_loss() {
-                debug!("local loss: protocol {} id {}", loss.transport, loss.id);
-                if loss.transport != u8::from(IpProtocol::Tcp) {
-                    continue;
-                }
-                let Some((index, seq)) = self.inner.loss_tags.take(loss.id) else {
-                    continue;
-                };
-                if let Some((_, socket)) = self.sockets.tcp.iter_mut().find(|(i, _)| *i == index) {
-                    socket.on_local_loss(now, seq);
+        // again in the egress below, and each packet of an extension's transport to it.
+        #[cfg(all(feature = "local-loss", any(feature = "tcp", feature = "extension")))]
+        {
+            let mut next = 0;
+            while let Some(index) = self.ifaces.next_occupied(next) {
+                next = index + 1;
+                while let Some(loss) = self.ifaces.get_mut(index).poll_local_loss() {
+                    debug!("local loss: protocol {} id {}", loss.transport, loss.id);
+                    #[cfg(feature = "extension")]
+                    if self
+                        .tx_context()
+                        .first_extension(
+                            |ext| ext.ip_protocols().contains(&loss.transport),
+                            |ext, cx| ext.on_local_loss(cx, loss),
+                        )
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    #[cfg(feature = "tcp")]
+                    {
+                        if loss.transport != u8::from(IpProtocol::Tcp) {
+                            continue;
+                        }
+                        let Some((index, seq)) = self.inner.loss_tags.take(loss.id) else {
+                            continue;
+                        };
+                        if let Some((_, socket)) = self.sockets.tcp.iter_mut().find(|(i, _)| *i == index) {
+                            socket.on_local_loss(now, seq);
+                        }
+                    }
                 }
             }
         }
@@ -1353,6 +1432,16 @@ impl<'d> Stack<'d> {
             self.ifaces.get_mut(index).multicast_egress(&mut self.inner, &mut clock);
         }
 
+        // Fire the extensions' timers that are due, after ingress so that they see what it
+        // delivered. A timer a hook sets for now or earlier fires at the next poll.
+        #[cfg(feature = "extension")]
+        {
+            let due = self.extensions.take_due(now);
+            if due != 0 {
+                self.tx_context().fire_timers(due);
+            }
+        }
+
         // Drive TCP egress: this both acknowledges what ingress just delivered and
         // advances the TCP timers (retransmissions, delayed ACKs, keep-alives,
         // zero-window probes, ...).
@@ -1361,6 +1450,8 @@ impl<'d> Stack<'d> {
             let mut cx = TxContext {
                 inner: &mut self.inner,
                 ifaces: &mut self.ifaces,
+                #[cfg(feature = "extension")]
+                extensions: &mut self.extensions,
             };
             for (index, socket) in self.sockets.tcp.iter_mut() {
                 // A segment the device has no room for goes out when the driver wakes
@@ -1421,6 +1512,15 @@ impl<'d> Stack<'d> {
 
         #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
         self.fragments.assembler.remove_expired(&mut clock);
+
+        // The extensions' timers count toward the deadline, so that the application wakes
+        // for them. One already due asks for a poll at once.
+        #[cfg(feature = "extension")]
+        for at in self.extensions.timers() {
+            if clock.expired(at) {
+                clock.after(Duration::from_millis(1));
+            }
+        }
 
         clock.next()
     }
@@ -1794,7 +1894,10 @@ impl<'d> Stack<'d> {
 
         #[cfg(not(feature = "icmp-ping-reply"))]
         let _ = (iface, src_addr, dst_addr);
-        #[cfg(not(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp"))))]
+        #[cfg(not(all(
+            feature = "icmp-errors",
+            any(feature = "udp", feature = "tcp", feature = "extension")
+        )))]
         let _ = &mut icmp_packet;
 
         match (icmp_packet.msg_type(), icmp_packet.msg_code()) {
@@ -1859,7 +1962,10 @@ impl<'d> Stack<'d> {
             (Icmpv4Message::EchoReply, _) => {}
 
             // Deliver error messages to the socket whose packet provoked them.
-            #[cfg(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp")))]
+            #[cfg(all(
+                feature = "icmp-errors",
+                any(feature = "udp", feature = "tcp", feature = "extension")
+            ))]
             (msg_type, msg_code) if msg_type.is_error() => {
                 if let Some(error) = IcmpError::from_icmpv4(msg_type, msg_code) {
                     self.deliver_icmp_error(error, icmp_packet.data_mut());
@@ -1878,14 +1984,20 @@ impl<'d> Stack<'d> {
     /// match wins). TCP demux is by exact 4-tuple, and the socket additionally
     /// validates the quoted sequence number against its send window, so blindly
     /// spoofed errors cannot reset connections (RFC 5927).
-    #[cfg(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp")))]
+    #[cfg(all(
+        feature = "icmp-errors",
+        any(feature = "udp", feature = "tcp", feature = "extension")
+    ))]
     fn deliver_icmp_error(&mut self, error: IcmpError, quote: &mut [u8]) {
         let Some(quoted) = parse_quoted_packet(quote) else {
             trace!("icmp error: quote too short to identify a flow, ignoring");
             return;
         };
-        let local = SocketAddr::new(quoted.src_addr, quoted.src_port);
-        let remote = SocketAddr::new(quoted.dst_addr, quoted.dst_port);
+        #[cfg(any(feature = "udp", feature = "tcp"))]
+        let (local, remote) = (
+            SocketAddr::new(quoted.src_addr, quoted.src_port),
+            SocketAddr::new(quoted.dst_addr, quoted.dst_port),
+        );
         match quoted.protocol {
             #[cfg(feature = "udp")]
             IpProtocol::Udp => crate::udp::process_icmp_error(&mut self.sockets.udp, error, local, remote),
@@ -1893,6 +2005,15 @@ impl<'d> Stack<'d> {
             IpProtocol::Tcp => {
                 crate::tcp::process_icmp_error(&mut self.sockets.tcp, error, local, remote, quoted.tcp_seq)
             }
+            #[cfg(feature = "extension")]
+            protocol => {
+                let protocol = u8::from(protocol);
+                self.tx_context().first_extension(
+                    |ext| ext.ip_protocols().contains(&protocol),
+                    |ext, cx| ext.on_icmp_error(cx, error, quote),
+                );
+            }
+            #[allow(unreachable_patterns)]
             _ => {}
         }
     }
@@ -1925,6 +2046,14 @@ impl<'d> Stack<'d> {
         let payload_len = ipv6_packet.payload_len() as usize;
         #[cfg(feature = "tcp")]
         let ecn = ipv6_packet.traffic_class() & 0b11;
+        #[cfg(feature = "extension")]
+        let ip = IpInfo {
+            src: src_addr,
+            dst: dst_addr,
+            traffic_class: ipv6_packet.traffic_class(),
+            hop_limit,
+            iface,
+        };
 
         if !src_addr.x_is_unicast() {
             // Discard packets with non-unicast source addresses.
@@ -1966,8 +2095,12 @@ impl<'d> Stack<'d> {
         // header starts, `nh_offset` is the offset of the field naming it, quoted in
         // the "unrecognized next header" error pointer.
         let (next_header, l4_offset, nh_offset) = if next_header == IpProtocol::HopByHop {
-            match check!(process_hop_by_hop(&buf[IPV6_HEADER_LEN..])) {
+            match check!(process_hop_by_hop(&buf[IPV6_HEADER_LEN..], |kind| self.hbh_option_claimed(kind))) {
                 HopByHopAction::Continue { next_header, ext_len } => {
+                    #[cfg(feature = "extension")]
+                    if !self.apply_verdict(iface, &mut buf, Path::Received) {
+                        return;
+                    }
                     (next_header, IPV6_HEADER_LEN + ext_len, IPV6_HEADER_LEN)
                 }
                 HopByHopAction::Discard => return,
@@ -1991,6 +2124,22 @@ impl<'d> Stack<'d> {
             (next_header, IPV6_HEADER_LEN, 6)
         };
 
+        // A routing header of a type an extension processes (RFC 8200 section 4.4). The
+        // stack treats the others as before, as a next header it doesn't support.
+        #[cfg(feature = "extension")]
+        let (next_header, l4_offset, nh_offset) = match self.routing_header(&ip, &mut buf, next_header, l4_offset) {
+            None => (next_header, l4_offset, nh_offset),
+            Some((RouteVerdict::Deliver, ext)) => (ext.0, l4_offset + ext.1, l4_offset),
+            Some((RouteVerdict::Forward(next), _)) => {
+                if self.inner.ipv6_forwarding {
+                    Ipv6Packet::new_unchecked(&mut buf).set_dst_addr(next);
+                    self.forward_ipv6_routed(iface, buf);
+                }
+                return;
+            }
+            Some((RouteVerdict::Discard, _)) => return,
+        };
+
         // Offer the whole packet to IP-mode raw sockets. Protocols the stack itself
         // processes are copied to the socket, everything else is consumed by it.
         #[cfg_attr(not(feature = "udp"), allow(unused_variables))]
@@ -2009,6 +2158,14 @@ impl<'d> Stack<'d> {
         buf.pull_front(l4_offset);
 
         match next_header {
+            #[cfg(feature = "extension")]
+            IpProtocol::Icmpv6 if self.icmpv6_claimed(&buf, &ip) => {
+                let ip = &ip;
+                self.tx_context().first_extension(
+                    |ext| buf.first().is_some_and(|kind| ext.icmpv6_types().contains(kind)),
+                    |ext, cx| ext.on_icmpv6(cx, ip, &buf),
+                );
+            }
             IpProtocol::Icmpv6 => self.process_icmpv6(iface, ll_src, src_addr, dst_addr, hop_limit, buf, now),
             #[cfg(feature = "udp")]
             IpProtocol::Udp => self.process_udp(
@@ -2021,6 +2178,24 @@ impl<'d> Stack<'d> {
             ),
             #[cfg(feature = "tcp")]
             IpProtocol::Tcp => self.process_tcp(iface, IpAddr::V6(src_addr), IpAddr::V6(dst_addr), ecn, buf, now),
+            #[cfg(feature = "extension")]
+            protocol
+                if self
+                    .extensions
+                    .any(|ext| ext.ip_protocols().contains(&u8::from(protocol))) =>
+            {
+                let protocol = u8::from(protocol);
+                let ip = &ip;
+                let mut buf = Some(buf);
+                self.tx_context().first_extension(
+                    |ext| ext.ip_protocols().contains(&protocol),
+                    |ext, cx| {
+                        if let Some(buf) = buf.take() {
+                            ext.on_transport(cx, ip, buf);
+                        }
+                    },
+                );
+            }
             _ => {
                 trace!("ipv6: protocol {} not supported", next_header);
                 // ICMPv6 parameter problem, unrecognized next header (RFC 4443
@@ -2040,10 +2215,100 @@ impl<'d> Stack<'d> {
         }
     }
 
+    /// Whether an extension processes hop-by-hop options of type `kind`.
+    #[cfg(feature = "ipv6")]
+    fn hbh_option_claimed(&self, kind: u8) -> bool {
+        #[cfg(feature = "extension")]
+        return self.extensions.any(|ext| ext.hbh_options().contains(&kind));
+        #[cfg(not(feature = "extension"))]
+        {
+            let _ = kind;
+            false
+        }
+    }
+
+    /// Runs the extensions' hop-by-hop options on `buf`, an IPv6 packet that arrived on
+    /// `iface`, and acts on their verdict; returns whether to go on with it.
+    #[cfg(feature = "extension")]
+    fn apply_verdict(&mut self, iface: IfaceHandle, buf: &mut PacketBuf, at: Path) -> bool {
+        match self.tx_context().hbh_options(buf, at, iface) {
+            Verdict::Continue => true,
+            Verdict::Discard => false,
+            Verdict::DiscardSendError { code, pointer } => {
+                self.transmit_icmpv6_error(iface, buf, Icmpv6Message::ParamProblem, code, pointer, false);
+                false
+            }
+        }
+    }
+
+    /// Hands the routing header at `offset` in `buf`, if `next_header` names one and an
+    /// extension processes its type, to that extension. Returns its verdict, and the
+    /// header's next header and length.
+    #[cfg(feature = "extension")]
+    fn routing_header(
+        &mut self,
+        ip: &IpInfo,
+        buf: &mut PacketBuf,
+        next_header: IpProtocol,
+        offset: usize,
+    ) -> Option<(RouteVerdict, (IpProtocol, usize))> {
+        if next_header != IpProtocol::Ipv6Route {
+            return None;
+        }
+        let (routing_type, next, len) = {
+            let ext = Ipv6ExtHeader::new_checked(buf.get(offset..)?).ok()?;
+            // The routing type follows the next header and length fields.
+            (*ext.data().first()?, ext.next_header(), ext.header_len())
+        };
+        let header = &mut buf[offset..offset + len];
+        let verdict = self.tx_context().first_extension(
+            |ext| ext.routing_types().contains(&routing_type),
+            |ext, cx| ext.on_routing_header(cx, ip, header),
+        )?;
+        Some((verdict, (next, len)))
+    }
+
+    /// Whether `message`, an ICMPv6 message for this node, is of a type an extension
+    /// takes, with a good checksum.
+    #[cfg(feature = "extension")]
+    fn icmpv6_claimed(&self, message: &[u8], ip: &IpInfo) -> bool {
+        let Some(&kind) = message.first() else {
+            return false;
+        };
+        if !self.extensions.any(|ext| ext.icmpv6_types().contains(&kind)) {
+            return false;
+        }
+        if message.len() < 4 {
+            return false;
+        }
+        self.ifaces.get(ip.iface.index()).checksum_caps().icmpv6.rx
+            || checksum::combine(&[
+                checksum::pseudo_header_v6(&ip.src, &ip.dst, IpProtocol::Icmpv6, message.len() as u32),
+                checksum::data(message),
+            ]) == !0
+    }
+
     /// Forward `buf`, an IPv6 packet for another node that arrived on `arrival`, as
     /// [`set_ipv6_forwarding`](Self::set_ipv6_forwarding) describes.
     #[cfg(feature = "ipv6")]
-    fn forward_ipv6(&mut self, arrival: IfaceHandle, mut buf: PacketBuf) {
+    fn forward_ipv6(
+        &mut self,
+        arrival: IfaceHandle,
+        #[cfg_attr(not(feature = "extension"), allow(unused_mut))] mut buf: PacketBuf,
+    ) {
+        // The hop-by-hop options the extensions process (RFC 8200 section 4.3: every node
+        // on the path).
+        #[cfg(feature = "extension")]
+        if !self.apply_verdict(arrival, &mut buf, Path::Forwarded) {
+            return;
+        }
+        self.forward_ipv6_routed(arrival, buf);
+    }
+
+    /// [`forward_ipv6`](Self::forward_ipv6) once the hop-by-hop options are processed: for
+    /// a packet a routing header sends on, whose options were processed on receipt.
+    #[cfg(feature = "ipv6")]
+    fn forward_ipv6_routed(&mut self, arrival: IfaceHandle, mut buf: PacketBuf) {
         let (src_addr, dst_addr, hop_limit) = {
             let packet = Ipv6Packet::new_unchecked(&mut buf);
             (packet.src_addr(), packet.dst_addr(), packet.hop_limit())
@@ -2090,6 +2355,20 @@ impl<'d> Stack<'d> {
             debug!("no room to forward, dropping");
             return;
         }
+        #[cfg(feature = "extension")]
+        match self.tx_context().egress(Path::Forwarded, &mut buf, route.ip_headroom) {
+            Verdict::Continue => {}
+            Verdict::Discard => return,
+            Verdict::DiscardSendError { code, pointer } => {
+                self.transmit_icmpv6_error(arrival, &mut buf, Icmpv6Message::ParamProblem, code, pointer, false);
+                return;
+            }
+        }
+        #[cfg(feature = "extension")]
+        if buf.len() > route.ip_mtu {
+            debug!("an extension's options made the packet too big to forward, dropping");
+            return;
+        }
         let iface = self.ifaces.get_mut(route.iface.index());
         self.inner
             .transmit_ip(iface, IpAddr::V6(dst_addr), route.next_hop, buf, EthernetProtocol::Ipv6);
@@ -2119,7 +2398,10 @@ impl<'d> Stack<'d> {
             return;
         }
 
-        #[cfg(not(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp"))))]
+        #[cfg(not(all(
+            feature = "icmp-errors",
+            any(feature = "udp", feature = "tcp", feature = "extension")
+        )))]
         let _ = &mut icmp_packet;
 
         match icmp_packet.msg_type() {
@@ -2169,7 +2451,10 @@ impl<'d> Stack<'d> {
             Icmpv6Message::EchoReply => {}
 
             // Deliver error messages to the socket whose packet provoked them.
-            #[cfg(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp")))]
+            #[cfg(all(
+                feature = "icmp-errors",
+                any(feature = "udp", feature = "tcp", feature = "extension")
+            ))]
             msg_type if msg_type.is_error() => {
                 if let Some(error) = IcmpError::from_icmpv6(msg_type, icmp_packet.msg_code()) {
                     self.deliver_icmp_error(error, icmp_packet.payload_mut());
@@ -3341,15 +3626,18 @@ enum HopByHopAction {
 
 /// Walk a hop-by-hop options header (`payload` starts at the extension header).
 ///
-/// Recognized options (padding, router alert) are skipped. Unrecognized ones are
-/// acted on per the two high bits of their type (RFC 8200 §4.2).
+/// Recognized options (padding, router alert, and those an extension processes, which
+/// `claimed` names) are skipped. Unrecognized ones are acted on per the two high bits of
+/// their type (RFC 8200 §4.2).
 #[cfg(feature = "ipv6")]
-fn process_hop_by_hop(payload: &[u8]) -> Result<HopByHopAction, Malformed> {
+fn process_hop_by_hop(payload: &[u8], claimed: impl Fn(u8) -> bool) -> Result<HopByHopAction, Malformed> {
     let ext = Ipv6ExtHeader::new_checked(payload)?;
     for option in Ipv6OptionsIter::new(ext.data()) {
         let (offset, option_type, _data) = option?;
         match option_type {
             Ipv6OptionType::Pad1 | Ipv6OptionType::PadN | Ipv6OptionType::RouterAlert => {}
+            // Processed by an extension, after this walk.
+            claimed_type if claimed(claimed_type.into()) => {}
             unrecognized => {
                 // The option sits 2 bytes into the extension header, which itself
                 // starts right after the fixed IPv6 header.

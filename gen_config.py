@@ -51,6 +51,9 @@ feature("raw_socket_count", default=2, min=1, max=64, pow2=8)
 feature("tcp_socket_count", default=4, min=1, max=64, pow2=8)
 feature("tcp_listener_count", default=2, min=1, max=64, pow2=8)
 
+# Extensions (feature `extension`). Always bounded.
+feature("extension_count", default=1, min=1, max=8)
+
 # Per-socket queues. Always bounded.
 feature("udp_rx_queue_count", default=4, min=1, max=64, pow2=8)
 feature("raw_rx_queue_count", default=4, min=1, max=64, pow2=8)

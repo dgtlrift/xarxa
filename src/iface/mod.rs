@@ -27,7 +27,8 @@ use crate::fragmentation::Fragmenter;
     feature = "tcp",
     feature = "_raw",
     feature = "medium-ethernet",
-    feature = "medium-ieee802154"
+    feature = "medium-ieee802154",
+    feature = "extension"
 ))]
 use crate::stack::Blocked;
 #[cfg(feature = "packetmeta-timestamp")]
@@ -820,13 +821,14 @@ impl IfaceState<'_> {
         feature = "ipv4-fragmentation",
         feature = "sixlowpan-fragmentation",
         feature = "medium-ethernet",
-        feature = "medium-ieee802154"
+        feature = "medium-ieee802154",
+        feature = "extension"
     ))]
     pub(crate) fn can_transmit(&mut self) -> bool {
         self.driver.can_transmit()
     }
 
-    #[cfg(all(feature = "local-loss", feature = "tcp"))]
+    #[cfg(all(feature = "local-loss", any(feature = "tcp", feature = "extension")))]
     pub(crate) fn poll_local_loss(&mut self) -> Option<crate::driver::LocalLoss> {
         self.driver.poll_local_loss()
     }
@@ -853,7 +855,8 @@ impl IfaceState<'_> {
         feature = "tcp",
         feature = "_raw",
         feature = "medium-ethernet",
-        feature = "medium-ieee802154"
+        feature = "medium-ieee802154",
+        feature = "extension"
     ))]
     pub(crate) fn can_transmit_new_packet(&mut self) -> Result<(), Blocked> {
         if !self.can_transmit() {
