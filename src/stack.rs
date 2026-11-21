@@ -1353,6 +1353,25 @@ impl<'d> Stack<'d> {
             }
         }
 
+        // Hand each neighbor a driver reports unreachable to the extensions.
+        #[cfg(all(feature = "neighbor-unreachable", feature = "extension"))]
+        {
+            let mut next = 0;
+            while let Some(index) = self.ifaces.next_occupied(next) {
+                next = index + 1;
+                let iface = IfaceHandle::new(index);
+                while let Some(neighbor) = self.ifaces.get_mut(index).poll_unreachable() {
+                    debug!("neighbor unreachable: {}", neighbor);
+                    // Extensions are IPv6's.
+                    let core::net::IpAddr::V6(neighbor) = neighbor else {
+                        continue;
+                    };
+                    self.tx_context()
+                        .every_extension(|_| true, |ext, cx| ext.on_neighbor_unreachable(cx, iface, neighbor));
+                }
+            }
+        }
+
         let mut next = 0;
         while let Some(index) = self.ifaces.next_occupied(next) {
             next = index + 1;
@@ -2024,6 +2043,15 @@ impl<'d> Stack<'d> {
             }
             #[allow(unreachable_patterns)]
             _ => {}
+        }
+        // And to the routing protocols, each once: one that carries the protocol has it.
+        #[cfg(feature = "extension")]
+        {
+            let protocol = u8::from(quoted.protocol);
+            self.tx_context().every_extension(
+                |ext| ext.route_errors() && !ext.ip_protocols().contains(&protocol),
+                |ext, cx| ext.on_icmp_error(cx, error, quote),
+            );
         }
     }
 

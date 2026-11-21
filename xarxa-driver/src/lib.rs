@@ -353,6 +353,25 @@ pub trait Driver {
         None
     }
 
+    /// Poll for a neighbor the link couldn't reach.
+    ///
+    /// Returns the next neighbor, by the [`PacketMeta::next_hop`] of the packet it was
+    /// sent, that acknowledged none of a frame's transmissions: its link layer sent the
+    /// frame and every retry, and none was acknowledged. A frame the link refused,
+    /// dropped, or never sent for a busy channel doesn't count, nor does a broadcast.
+    /// A routing protocol uses the reports to repair its routes through that neighbor.
+    ///
+    /// Like local losses, the reports come an arbitrary time after
+    /// [`transmit`](Self::transmit) returned, and may never come. A neighbor may be
+    /// reported again for a later frame.
+    ///
+    /// Drivers that cannot tell always return `None`, which is the default
+    /// implementation.
+    #[cfg(feature = "neighbor-unreachable")]
+    fn poll_unreachable(&mut self) -> Option<core::net::IpAddr> {
+        None
+    }
+
     /// Whether the link is congested right now: its queue at the driver's threshold, or
     /// its airtime near a duty-cycle limit, as the link layer judges it.
     ///
@@ -431,6 +450,10 @@ impl<T: Driver + ?Sized> Driver for &mut T {
     #[cfg(feature = "local-loss")]
     fn poll_local_loss(&mut self) -> Option<LocalLoss> {
         T::poll_local_loss(self)
+    }
+    #[cfg(feature = "neighbor-unreachable")]
+    fn poll_unreachable(&mut self) -> Option<core::net::IpAddr> {
+        T::poll_unreachable(self)
     }
     #[cfg(feature = "traffic-class")]
     fn congested(&mut self) -> bool {

@@ -14,6 +14,11 @@
 //!   the interface, to add or rewrite an option ([`on_egress`](Extension::on_egress)).
 //! - **Transport packets** of the IP protocols it names, the ICMP errors quoting them and
 //!   the drivers' reports of their loss ([`on_transport`](Extension::on_transport)).
+//! - **Every ICMP error**, whatever it quotes, if it asks for them
+//!   ([`route_errors`](Extension::route_errors)), as a routing protocol does to hear of a
+//!   route that failed further on.
+//! - **A neighbor the link couldn't reach**, from the drivers' reports
+//!   ([`on_neighbor_unreachable`](Extension::on_neighbor_unreachable)).
 //! - **Its timer** ([`on_timer`](Extension::on_timer)), armed with
 //!   [`ExtCx::set_timer`]. [`Stack::poll`](crate::Stack::poll) fires it once its instant
 //!   has come, and counts it in the deadline it returns, so an application that waits on
@@ -115,11 +120,31 @@ pub trait Extension {
         let _ = (cx, ip, packet);
     }
 
-    /// An ICMP error quoting a packet of one of [`ip_protocols`](Self::ip_protocols):
-    /// `quoted` is that packet, from its IP header, as much of it as the error carries.
+    /// An ICMP error quoting a packet of one of [`ip_protocols`](Self::ip_protocols), or
+    /// any ICMP error if it takes [`route_errors`](Self::route_errors): `quoted` is that
+    /// packet, from its IP header, as much of it as the error carries.
+    ///
+    /// An error quoting a transport the stack carries goes to its socket as well.
     #[cfg(feature = "icmp-errors")]
     fn on_icmp_error(&mut self, cx: &mut ExtCx<'_, '_>, error: IcmpError, quoted: &[u8]) {
         let _ = (cx, error, quoted);
+    }
+
+    /// Whether it takes every ICMP error the stack receives, whatever the quoted packet's
+    /// protocol, in [`on_icmp_error`](Self::on_icmp_error): as a routing protocol does, to
+    /// hear that a route it made failed further on (a Destination Unreachable, no route
+    /// to destination, RFC 4443 section 3.1).
+    #[cfg(feature = "icmp-errors")]
+    fn route_errors(&self) -> bool {
+        false
+    }
+
+    /// A driver reported that `neighbor`, on `iface`, acknowledged none of a frame's
+    /// transmissions (`Driver::poll_unreachable`): to repair the routes through it. IPv4
+    /// neighbors aren't reported.
+    #[cfg(feature = "neighbor-unreachable")]
+    fn on_neighbor_unreachable(&mut self, cx: &mut ExtCx<'_, '_>, iface: IfaceHandle, neighbor: Ipv6Addr) {
+        let _ = (cx, iface, neighbor);
     }
 
     /// A driver lost a packet of one of [`ip_protocols`](Self::ip_protocols) before it
@@ -648,6 +673,18 @@ impl<'d> TxContext<'_, 'd> {
         mut hook: impl FnMut(&mut dyn Extension, &mut ExtCx<'_, 'd>) -> T,
     ) -> Option<T> {
         (0..crate::config::EXTENSION_COUNT).find_map(|index| self.call_extension(index, &mut wants, &mut hook))
+    }
+
+    /// Calls `hook` on every extension that `wants` the call.
+    #[cfg(any(feature = "icmp-errors", feature = "neighbor-unreachable"))]
+    pub(crate) fn every_extension(
+        &mut self,
+        mut wants: impl FnMut(&dyn Extension) -> bool,
+        mut hook: impl FnMut(&mut dyn Extension, &mut ExtCx<'_, 'd>),
+    ) {
+        for index in 0..crate::config::EXTENSION_COUNT {
+            self.call_extension(index, &mut wants, &mut hook);
+        }
     }
 
     /// Calls `hook` on each extension in turn, stopping at the first verdict that isn't

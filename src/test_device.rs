@@ -108,6 +108,9 @@ pub struct TestDevice {
     /// Local-loss reports for the stack to poll, oldest first.
     #[cfg(feature = "local-loss")]
     pub losses: Losses,
+    /// Neighbors reported unreachable, for the stack to poll, oldest first.
+    #[cfg(feature = "neighbor-unreachable")]
+    pub unreachable: Rc<RefCell<VecDeque<core::net::IpAddr>>>,
     /// Whether it reports congestion, and the CE marks reported to it.
     #[cfg(feature = "traffic-class")]
     pub congestion: Congestion,
@@ -150,6 +153,8 @@ impl TestDevice {
             tx_stamps: VecDeque::new(),
             #[cfg(feature = "local-loss")]
             losses: Rc::new(RefCell::new(VecDeque::new())),
+            #[cfg(feature = "neighbor-unreachable")]
+            unreachable: Rc::new(RefCell::new(VecDeque::new())),
             #[cfg(feature = "traffic-class")]
             congestion: Rc::new(Cell::new((false, 0))),
         }
@@ -282,6 +287,11 @@ impl Driver for TestDevice {
     #[cfg(feature = "local-loss")]
     fn poll_local_loss(&mut self) -> Option<LocalLoss> {
         self.losses.borrow_mut().pop_front()
+    }
+
+    #[cfg(feature = "neighbor-unreachable")]
+    fn poll_unreachable(&mut self) -> Option<core::net::IpAddr> {
+        self.unreachable.borrow_mut().pop_front()
     }
 
     fn set_multicast_filter(&mut self, addrs: &[[u8; 6]]) {

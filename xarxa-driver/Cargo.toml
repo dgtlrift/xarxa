@@ -55,6 +55,10 @@ traffic-class = []
 ## packet is routed to, for a driver that maps it to a link address itself, as a
 ## 6LoWPAN layer under a `Medium::Ip` interface does.
 packetmeta-next-hop = []
+## Enable `Driver::poll_unreachable`, by which a driver reports a neighbor that
+## acknowledged none of a frame's transmissions, by the `PacketMeta::next_hop` the
+## frame's packet carried, so this implies `packetmeta-next-hop`.
+neighbor-unreachable = ["packetmeta-next-hop"]
 
 [dependencies]
 document-features = "0.2.11"

@@ -38,6 +38,8 @@ enum Call {
     IcmpError(IcmpError, u8),
     #[cfg(feature = "local-loss")]
     Loss(u32),
+    #[cfg(feature = "neighbor-unreachable")]
+    Unreachable(IfaceHandle, Ipv6Addr),
 }
 
 /// An extension that records its calls and does what its fields say.
@@ -56,6 +58,8 @@ struct Mock {
     add_option: Option<[u8; 4]>,
     /// Whether `on_icmpv6` answers, with the message echoed back.
     echo: bool,
+    /// Whether it takes every ICMP error.
+    route_errors: bool,
 }
 
 impl Mock {
@@ -70,6 +74,7 @@ impl Mock {
             route: RouteVerdict::Deliver,
             add_option: None,
             echo: false,
+            route_errors: false,
         };
         (mock, calls)
     }
@@ -147,9 +152,19 @@ impl Extension for Mock {
         self.log(Call::IcmpError(error, quoted[6]));
     }
 
+    #[cfg(feature = "icmp-errors")]
+    fn route_errors(&self) -> bool {
+        self.route_errors
+    }
+
     #[cfg(feature = "local-loss")]
     fn on_local_loss(&mut self, _: &mut ExtCx<'_, '_>, loss: LocalLoss) {
         self.log(Call::Loss(loss.id));
+    }
+
+    #[cfg(feature = "neighbor-unreachable")]
+    fn on_neighbor_unreachable(&mut self, _: &mut ExtCx<'_, '_>, iface: IfaceHandle, neighbor: Ipv6Addr) {
+        self.log(Call::Unreachable(iface, neighbor));
     }
 }
 
@@ -503,6 +518,90 @@ fn a_local_loss_of_its_protocol_is_handed_over() {
     });
     stack.poll(Instant::ZERO);
     assert_eq!(calls.borrow()[1], Call::Loss(42));
+}
+
+#[cfg(all(feature = "icmp-errors", feature = "udp"))]
+#[test]
+fn a_routing_extension_takes_an_error_quoting_a_udp_datagram() {
+    let (mut mock, calls) = Mock::new();
+    mock.route_errors = true;
+    let (mut stack, device, _) = stack_with(mock);
+    let quoted = ipv6_packet(
+        OURS,
+        FAR,
+        IpProtocol::Udp,
+        &udp_datagram(OURS.into(), 5000, FAR.into(), 5001, b"hi"),
+    );
+    let mut body = vec![0; 4];
+    body.extend_from_slice(&quoted);
+    let error = icmpv6(Icmpv6Message::DstUnreachable.into(), &body, PEER, OURS);
+    inject(
+        &mut stack,
+        &device.rx,
+        ipv6_packet(PEER, OURS, IpProtocol::Icmpv6, &error),
+    );
+    assert_eq!(
+        calls.borrow()[1..],
+        [Call::IcmpError(IcmpError::NetUnreachable, u8::from(IpProtocol::Udp))]
+    );
+}
+
+#[cfg(feature = "icmp-errors")]
+#[test]
+fn an_error_goes_once_to_a_routing_extension_that_carries_the_protocol() {
+    let (mut mock, calls) = Mock::new();
+    mock.route_errors = true;
+    let (mut stack, device, _) = stack_with(mock);
+    let quoted = ipv6_packet(
+        OURS,
+        PEER,
+        IpProtocol::from(PROTOCOL),
+        &[0x13, 0x88, 0x13, 0x89, 0, 0, 0, 1],
+    );
+    let mut body = vec![0; 4];
+    body.extend_from_slice(&quoted);
+    let error = icmpv6(Icmpv6Message::DstUnreachable.into(), &body, PEER, OURS);
+    inject(
+        &mut stack,
+        &device.rx,
+        ipv6_packet(PEER, OURS, IpProtocol::Icmpv6, &error),
+    );
+    assert_eq!(
+        calls.borrow()[1..],
+        [Call::IcmpError(IcmpError::NetUnreachable, PROTOCOL)]
+    );
+}
+
+#[cfg(all(feature = "icmp-errors", feature = "udp"))]
+#[test]
+fn an_error_quoting_a_udp_datagram_skips_other_extensions() {
+    let (mock, calls) = Mock::new();
+    let (mut stack, device, _) = stack_with(mock);
+    let quoted = ipv6_packet(
+        OURS,
+        FAR,
+        IpProtocol::Udp,
+        &udp_datagram(OURS.into(), 5000, FAR.into(), 5001, b"hi"),
+    );
+    let mut body = vec![0; 4];
+    body.extend_from_slice(&quoted);
+    let error = icmpv6(Icmpv6Message::DstUnreachable.into(), &body, PEER, OURS);
+    inject(
+        &mut stack,
+        &device.rx,
+        ipv6_packet(PEER, OURS, IpProtocol::Icmpv6, &error),
+    );
+    assert_eq!(calls.borrow()[1..], []);
+}
+
+#[cfg(feature = "neighbor-unreachable")]
+#[test]
+fn an_unreachable_neighbor_is_handed_over() {
+    let (mock, calls) = Mock::new();
+    let (mut stack, device, iface) = stack_with(mock);
+    device.unreachable.borrow_mut().push_back(PEER.into());
+    stack.poll(Instant::ZERO);
+    assert_eq!(calls.borrow()[1..], [Call::Unreachable(iface, PEER)]);
 }
 
 #[test]
